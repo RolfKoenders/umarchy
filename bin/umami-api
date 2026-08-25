@@ -1,0 +1,201 @@
+#!/usr/bin/env python3
+"""Umami API helper for the Umarchy Omarchy plugin.
+
+Performs a single Umami API request outside the long-lived shell process.
+Reads one line of JSON from stdin describing the request, makes the HTTP
+call, and prints the (byte-capped) response body as compact JSON on stdout.
+
+QML's own XMLHttpRequest can't bound this itself: Qt materializes every
+received byte into responseText as it streams in, inside the shared shell
+process, before any JS callback gets a chance to inspect or abort it. Doing
+the read here, in a short-lived subprocess, means an oversized or hostile
+response is capped by this process's own socket read and never enters the
+shell's memory at all. (Same reasoning, and largely the same code, as
+Keeply's bin/keeply-api — see HANCORE-linux/omarchy-plugin-marketplace#1750
+for the review history that produced this shape.)
+
+Protocol:
+  stdin:  {"method": "GET"|"POST", "path": "/api/...", "host": "https://...",
+            "token": "<jwt>"|null, "body": {...}|null}
+  stdout (exit 0): the response body, re-serialized as compact single-line JSON
+  stderr (exit != 0): a short error message; see exit codes below
+
+Exit codes:
+  0  success
+  2  response exceeded the byte cap
+  3  non-2xx HTTP status, including a blocked redirect (stderr is "http_status:<code>")
+  4  any other failure (bad request line, invalid host, network error, timeout,
+     invalid JSON body)
+"""
+
+import json
+import os
+import sys
+import time
+import urllib.error
+import urllib.parse
+import urllib.request
+
+# Every response here is a small stats/list document; 5 MiB is generous while
+# still bounding what this process will ever hold in memory. Overridable via
+# env for tests (so a cap/timeout test doesn't need a real multi-megabyte
+# payload or a real 30-second wait); production always gets the defaults.
+MAX_RESPONSE_BYTES = int(os.environ.get("UMAMI_API_MAX_RESPONSE_BYTES", str(5 * 1024 * 1024)))
+
+# Bounds a single socket operation (connect, or one read). This alone does
+# NOT bound the total request: a server that sends one byte every 9 seconds
+# never trips it while never finishing either. TOTAL_TIMEOUT_SECONDS below
+# is the real bound on how long this process can be kept alive.
+SOCKET_TIMEOUT_SECONDS = float(os.environ.get("UMAMI_API_SOCKET_TIMEOUT", "10"))
+TOTAL_TIMEOUT_SECONDS = float(os.environ.get("UMAMI_API_TOTAL_TIMEOUT", "30"))
+
+
+class _NoRedirectHandler(urllib.request.HTTPRedirectHandler):
+    """Refuses to follow any redirect.
+
+    urllib follows redirects by default and resends the same headers,
+    including Authorization, to wherever the redirect points — a malicious
+    or compromised response could redirect off the configured host entirely
+    and walk off with the token, or reach an internal/local-network target.
+    The Umami API has no legitimate reason to redirect, so none are
+    followed; a 3xx is surfaced like any other non-2xx status.
+    """
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        return None
+
+
+_opener = urllib.request.build_opener(_NoRedirectHandler)
+
+
+def read_capped(resp, max_bytes, deadline):
+    """Read a response body up to max_bytes, raising if it's exceeded.
+
+    resp.read() with no argument reads the entire body regardless of size;
+    reading in bounded chunks instead means an oversized response can't be
+    accepted into memory. deadline (a time.monotonic() value) also bounds
+    total wall-clock time — but only because each read below asks for
+    exactly ONE byte, not some larger chunk size.
+
+    That one-byte size is load-bearing, not a style choice: http.client's
+    read(n) tries to accumulate min(n, bytes remaining) before returning,
+    driving its own internal recv() loop invisibly to this function. A
+    server that sends one byte every 0.4s — comfortably under any
+    per-socket idle timeout — can keep a single read(65536) call blocked
+    for the full duration of a slow response (confirmed empirically: a
+    drip-fed 20-byte body took 7.6 real seconds inside ONE such call, with
+    a 1-second per-socket timeout that never fired, because no individual
+    recv() call ever actually stalled). The deadline check below can only
+    run BETWEEN calls to resp.read(), so as long as each call is sized to
+    return the moment a single byte arrives, this loop regains control
+    after every byte and the deadline is actually enforced — not just
+    checked at a point the attacker can route around.
+    """
+    chunks = []
+    total = 0
+    while True:
+        if time.monotonic() > deadline:
+            raise TimeoutError(f"Request exceeded {TOTAL_TIMEOUT_SECONDS} second time limit")
+        chunk = resp.read(1)
+        if not chunk:
+            break
+        total += len(chunk)
+        if total > max_bytes:
+            raise ValueError(f"Response exceeded {max_bytes} byte limit")
+        chunks.append(chunk)
+    return b"".join(chunks)
+
+
+def validate_host(host):
+    """Only http(s) with a real netloc, no embedded userinfo tricks.
+
+    Raises RuntimeError, not ValueError — ValueError is reserved for
+    read_capped()'s byte-cap violation so the two can't be confused in
+    main()'s exit-code mapping below.
+    """
+    parsed = urllib.parse.urlsplit(host)
+    if parsed.scheme not in ("http", "https"):
+        raise RuntimeError("host must be http:// or https://")
+    if not parsed.netloc or "@" in parsed.netloc:
+        raise RuntimeError("host is not a plain origin")
+    return f"{parsed.scheme}://{parsed.netloc}"
+
+
+def make_request(method, host, path, token, body):
+    """Perform the HTTP call and return (status, capped_body_bytes)."""
+    origin = validate_host(host)
+    if not path.startswith("/"):
+        raise RuntimeError("path must be absolute")
+    data = json.dumps(body).encode("utf-8") if body is not None else None
+    headers = {
+        "Content-Type": "application/json",
+        "Accept": "application/json",
+        "User-Agent": "umarchy-omarchy/0.1.0",
+    }
+    if token:
+        headers["Authorization"] = "Bearer " + token
+    req = urllib.request.Request(origin + path, data=data, headers=headers, method=method)
+    deadline = time.monotonic() + TOTAL_TIMEOUT_SECONDS
+    try:
+        with _opener.open(req, timeout=SOCKET_TIMEOUT_SECONDS) as resp:
+            return resp.status, read_capped(resp, MAX_RESPONSE_BYTES, deadline)
+    except urllib.error.HTTPError as e:
+        # Drain (and still cap) the error body, but its content is never
+        # surfaced — only the status code is. A blocked redirect also lands
+        # here, as its 3xx status.
+        try:
+            read_capped(e, MAX_RESPONSE_BYTES, deadline)
+        except (ValueError, TimeoutError):
+            pass
+        return e.code, b""
+
+
+def main():
+    try:
+        request_line = sys.stdin.readline()
+        payload = json.loads(request_line)
+        method = payload["method"]
+        path = payload["path"]
+        host = payload["host"]
+        token = payload.get("token")
+        body = payload.get("body")
+        if method not in ("GET", "POST"):
+            raise ValueError("unsupported method")
+    except Exception as e:
+        print("Invalid request: " + str(e), file=sys.stderr)
+        sys.exit(4)
+
+    try:
+        status, response_bytes = make_request(method, host, path, token, body)
+    except ValueError:
+        # Only read_capped()'s byte-cap violation raises plain ValueError;
+        # everything else (bad host, bad path, timeout, network error) is
+        # RuntimeError/other and falls through to the generic branch below.
+        print("Response too large", file=sys.stderr)
+        sys.exit(2)
+    except Exception as e:
+        print(str(e), file=sys.stderr)
+        sys.exit(4)
+
+    if status < 200 or status >= 300:
+        print("http_status:" + str(status), file=sys.stderr)
+        sys.exit(3)
+
+    if not response_bytes:
+        print(json.dumps(None))
+        sys.exit(0)
+
+    try:
+        parsed = json.loads(response_bytes.decode("utf-8"))
+    except Exception:
+        print("Invalid response from server", file=sys.stderr)
+        sys.exit(4)
+
+    # Re-serialized compact (single-line) so the QML side can safely
+    # reconstruct it from newline-delimited process output.
+    print(json.dumps(parsed))
+    sys.exit(0)
+
+
+if __name__ == "__main__":
+    main()

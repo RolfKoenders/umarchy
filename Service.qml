@@ -1,0 +1,383 @@
+import QtQuick
+import Quickshell
+import Quickshell.Io
+import "Model.js" as Model
+
+// Session state: config, login/401-retry, site + period selection, stats,
+// refresh timer. Owns its own private state file rather than the generic
+// per-widget settings schema, matching omarchy-matomo/Service.qml — this
+// plugin's config (host/username/siteId/period/icon) has nothing to do
+// with the bar layout system, and the password never belongs in it at all.
+Item {
+  id: root
+
+  readonly property string home: Quickshell.env("HOME")
+  readonly property string stateDir: home + "/.local/state/omarchy/settings"
+  readonly property string configPath: stateDir + "/umarchy.json"
+  readonly property string tokenPath: stateDir + "/umarchy-token.json"
+
+  property var config: Model.emptyConfig()
+  property string token: ""
+  property string _cachedPassword: ""
+  property bool hasStoredPassword: false
+
+  property var sites: []
+  property var summary: ({ pageviews: 0, visitors: 0, visits: 0, bounces: 0, totaltime: 0 })
+  property var series: []
+  property var topPages: []
+  property var topReferrers: []
+  property var topCountries: []
+  property int activeVisitors: 0
+
+  property bool loading: false
+  property bool loadingSites: false
+  property bool checking: false
+  property bool connected: false
+  property bool secretRequired: false
+  property string lastError: ""
+  property int _pendingCalls: 0
+
+  property bool _reauthInFlight: false
+  property var _reauthQueue: []
+
+  property bool _writingConfig: false
+  property bool _writingToken: false
+
+  readonly property bool ready: Model.hasConnectionTarget(config)
+  readonly property var activeSiteObj: Model.activeSite(sites, config.siteId)
+  readonly property string siteLabel: activeSiteObj ? activeSiteObj.name : ""
+  readonly property var chartValues: Model.seriesValues(series)
+  readonly property var chartLabels: Model.seriesLabels(series)
+  readonly property string bounceRateLabel: Model.formatBounceRate(summary.bounces, summary.visits)
+  readonly property string avgTimeLabel: Model.formatAvgTime(summary.totaltime, summary.visits)
+  readonly property string barIcon: config.icon || "📈"
+  readonly property string barLabel: (!ready || !config.showLiveCount) ? barIcon
+    : barIcon + " " + Model.formatCount(activeVisitors)
+  readonly property string barTooltip: !ready
+    ? "Umarchy — add your Umami instance and view-only login"
+    : (siteLabel + " · " + Model.formatCount(activeVisitors) + " live · "
+       + Model.formatCount(summary.pageviews) + " pageviews")
+
+  function refresh() {
+    if (!root.ready) return
+    root.loading = true
+    root.lastError = ""
+    if (root.sites.length === 0) {
+      root.fetchSites(function() { root.fetchStatsBundle() })
+    } else {
+      root.fetchStatsBundle()
+    }
+  }
+
+  function fetchSites(then) {
+    root.loadingSites = true
+    // /api/websites paginates (default pageSize 10); 100 comfortably covers
+    // a personal/self-hosted account without needing real pagination.
+    root.authorizedRequest("GET", "/api/websites?pageSize=100", null, function(result, errorMessage) {
+      root.loadingSites = false
+      if (errorMessage) {
+        root.failLoad(errorMessage)
+        return
+      }
+      root.sites = Model.parseSites(result)
+      if (!root.config.siteId && root.sites.length) {
+        root.setSiteId(root.sites[0].id, false)
+      }
+      then()
+    })
+  }
+
+  function fetchStatsBundle() {
+    if (!root.activeSiteObj) {
+      root.loading = false
+      root.lastError = "No sites available for this account"
+      return
+    }
+    var siteId = root.activeSiteObj.id
+    var range = Model.periodRange(root.config.period, new Date())
+    var qs = "?startAt=" + range.startAt + "&endAt=" + range.endAt
+    var base = "/api/websites/" + encodeURIComponent(siteId)
+
+    root._pendingCalls = 6
+    var anyError = ""
+
+    function done(errorMessage) {
+      if (errorMessage && !anyError) anyError = errorMessage
+      root._pendingCalls -= 1
+      if (root._pendingCalls <= 0) {
+        root.loading = false
+        root.lastError = anyError
+      }
+    }
+
+    root.authorizedRequest("GET", base + "/active", null, function(result, err) {
+      if (!err) root.activeVisitors = Model.parseActiveVisitors(result)
+      done(err)
+    })
+    root.authorizedRequest("GET", base + "/stats" + qs, null, function(result, err) {
+      if (!err) root.summary = Model.parseStats(result)
+      done(err)
+    })
+    root.authorizedRequest("GET", base + "/pageviews" + qs + "&unit=" + range.unit, null, function(result, err) {
+      if (!err) root.series = Model.parsePageviewSeries(result)
+      done(err)
+    })
+    root.authorizedRequest("GET", base + "/metrics" + qs + "&type=path", null, function(result, err) {
+      if (!err) root.topPages = Model.parseMetricRows(result)
+      done(err)
+    })
+    root.authorizedRequest("GET", base + "/metrics" + qs + "&type=referrer", null, function(result, err) {
+      if (!err) root.topReferrers = Model.parseMetricRows(result)
+      done(err)
+    })
+    root.authorizedRequest("GET", base + "/metrics" + qs + "&type=country", null, function(result, err) {
+      if (!err) root.topCountries = Model.parseMetricRows(result)
+      done(err)
+    })
+  }
+
+  function failLoad(message) {
+    root.loading = false
+    root.lastError = message
+    root.connected = false
+  }
+
+  // Every authenticated call goes through here so the 401-retry policy
+  // (Model.nextAuthState) is applied uniformly. callback(result,
+  // errorMessage) — errorMessage is null on success.
+  function authorizedRequest(method, path, body, callback, isRetry) {
+    requestBridge.request(method, root.config.host, path, root.token, body,
+      function(result, errorCode, errorMessage) {
+        var state = Model.nextAuthState(errorCode, root.hasStoredPassword, !!isRetry)
+        if (state === "ok") {
+          root.connected = true
+          root.secretRequired = false
+          callback(result, null)
+        } else if (state === "retry") {
+          root.reauthenticateAndRetry(method, path, body, callback)
+        } else if (state === "prompt") {
+          root.secretRequired = true
+          callback(null, "Enter your Umami password")
+        } else {
+          callback(null, Model.errorMessageFor(errorCode, errorMessage))
+        }
+      })
+  }
+
+  // Coalesces concurrent 401s (a whole refresh bundle can hit a stale
+  // token at once) into a single login call, replaying every queued
+  // request against the outcome instead of firing one login per request.
+  function reauthenticateAndRetry(method, path, body, callback) {
+    root._reauthQueue.push({ method: method, path: path, body: body, callback: callback })
+    if (root._reauthInFlight) return
+    root._reauthInFlight = true
+    root.login(root._cachedPassword, function(ok) {
+      root._reauthInFlight = false
+      var queued = root._reauthQueue
+      root._reauthQueue = []
+      for (var i = 0; i < queued.length; i++) {
+        var item = queued[i]
+        if (ok) {
+          root.authorizedRequest(item.method, item.path, item.body, item.callback, true)
+        } else {
+          root.secretRequired = true
+          item.callback(null, "Umami rejected the saved password")
+        }
+      }
+    })
+  }
+
+  // done(ok) — ok is false on invalid credentials or an unreachable host.
+  function login(password, done) {
+    root.checking = true
+    requestBridge.request("POST", root.config.host, "/api/auth/login", null,
+      { username: root.config.username, password: password },
+      function(result, errorCode, errorMessage) {
+        root.checking = false
+        var loginToken = result && typeof result === "object" ? String(result.token || "") : ""
+        if (errorCode || !loginToken) {
+          root.connected = false
+          if (done) done(false)
+          return
+        }
+        root.token = loginToken
+        root._cachedPassword = password
+        root.hasStoredPassword = true
+        root.connected = true
+        root.secretRequired = false
+        root.lastError = ""
+        root.persistToken()
+        if (done) done(true)
+      })
+  }
+
+  function saveConnection(host, username, password) {
+    var normalizedHost = Model.normalizeHost(host)
+    if (!normalizedHost) {
+      root.lastError = "Enter a valid https:// Umami URL"
+      return
+    }
+    var trimmedUsername = String(username || "").trim()
+    if (!trimmedUsername) {
+      root.lastError = "Enter your view-only username"
+      return
+    }
+    var accountChanged = normalizedHost !== root.config.host || trimmedUsername !== root.config.username
+    root.persist({
+      host: normalizedHost,
+      username: trimmedUsername,
+      siteId: accountChanged ? "" : root.config.siteId
+    })
+    if (accountChanged) {
+      root.sites = []
+      root.token = ""
+      root._cachedPassword = ""
+      root.hasStoredPassword = false
+    }
+    if (!password) {
+      if (accountChanged) {
+        root.lastError = "Enter your view-only password"
+        return
+      }
+      root.refresh()
+      return
+    }
+    root.login(password, function(ok) {
+      if (ok) {
+        credentialManager.store(normalizedHost, trimmedUsername, password)
+        root.refresh()
+      } else {
+        root.lastError = "Incorrect username or password"
+      }
+    })
+  }
+
+  function setSiteId(id, thenRefresh) {
+    if (id === root.config.siteId) return
+    root.persist({ siteId: id })
+    root.summary = { pageviews: 0, visitors: 0, visits: 0, bounces: 0, totaltime: 0 }
+    root.series = []
+    root.topPages = []
+    root.topReferrers = []
+    root.topCountries = []
+    if (thenRefresh !== false) root.fetchStatsBundle()
+  }
+
+  function setPeriod(value) {
+    if (Model.periodOrDefault(value) === root.config.period) return
+    root.persist({ period: value })
+    root.fetchStatsBundle()
+  }
+
+  function setShowLiveCount(enabled) {
+    root.persist({ showLiveCount: enabled !== false })
+  }
+
+  function persist(values) {
+    root.config = Model.patchConfig(root.config, values)
+    root._writingConfig = true
+    ensureDirProc.running = true
+    configFile.setText(Model.serializeConfig(root.config))
+    chmodConfigProc.running = true
+  }
+
+  function persistToken() {
+    root._writingToken = true
+    ensureDirProc.running = true
+    tokenFile.setText(JSON.stringify({
+      token: root.token, host: root.config.host, username: root.config.username
+    }, null, 2) + "\n")
+    chmodTokenProc.running = true
+  }
+
+  RequestBridge { id: requestBridge }
+  CredentialManager { id: credentialManager }
+
+  Connections {
+    target: credentialManager
+    function onLookupFinished(password) {
+      root._cachedPassword = password
+      root.hasStoredPassword = password !== ""
+      // Only ever reached via configFile.onLoaded below, right after
+      // startup or a config reload — chaining the token-cache read (which
+      // ends in refresh()) from here, rather than firing both in parallel,
+      // guarantees hasStoredPassword is already correct before the first
+      // request can possibly hit a 401 and need it.
+      tokenFile.reload()
+    }
+  }
+
+  Process { id: ensureDirProc; command: ["mkdir", "-p", root.stateDir]; running: false }
+  Process { id: chmodConfigProc; command: ["chmod", "600", root.configPath]; running: false }
+  Process { id: chmodTokenProc; command: ["chmod", "600", root.tokenPath]; running: false }
+
+  property FileView configFile: FileView {
+    path: root.configPath
+    watchChanges: true
+    atomicWrites: true
+    printErrors: false
+    onFileChanged: reload()
+    onLoaded: {
+      // No chmod here: chmod-on-every-load, if the file watcher below
+      // reacts to the metadata touch (not just content), reloads the
+      // config right after every persist() — including the one persist()
+      // does on its OWN write — reasserting `root.config` and, with it,
+      // every `text: stats.config.x` binding on the settings fields. That
+      // snapped hostField/usernameField back to the last-saved (empty)
+      // value after every single keystroke (confirmed live: passwordField,
+      // which has no such binding, was unaffected). chmod only belongs
+      // right after persist() actually writes, matching
+      // omarchy-matomo/Service.qml's chmodProc usage.
+      if (root._writingConfig) { root._writingConfig = false; return }
+      root.config = Model.parseConfig(text())
+      if (root.ready) {
+        credentialManager.lookup(root.config.host, root.config.username)
+      }
+    }
+    onLoadFailed: {
+      root.config = Model.emptyConfig()
+    }
+  }
+
+  // Loaded only once config is known to be ready, so this never races
+  // config.host/username. Reads whatever cached token exists (there may be
+  // none yet, or one for a different account — either way this always
+  // finishes by calling refresh(), which is the one thing that must happen
+  // exactly once after startup).
+  property FileView tokenFile: FileView {
+    path: root.tokenPath
+    watchChanges: false
+    atomicWrites: true
+    printErrors: false
+    onLoaded: {
+      // chmod happens in persistToken() only, same reasoning as configFile
+      // above — not strictly necessary here since watchChanges is false for
+      // this file, but kept consistent rather than leaving a second copy of
+      // the pattern that looks like it could reintroduce the same bug.
+      if (root._writingToken) { root._writingToken = false; return }
+      try {
+        var data = JSON.parse(text() || "{}")
+        if (data && data.host === root.config.host && data.username === root.config.username && data.token) {
+          root.token = String(data.token)
+        }
+      } catch (e) {
+        // no usable cached token — fine, an authorizedRequest 401 will
+        // trigger a fresh login as long as the password is in the keyring
+      }
+      root.refresh()
+    }
+    onLoadFailed: root.refresh()
+  }
+
+  Timer {
+    interval: 60000
+    running: root.ready
+    repeat: true
+    onTriggered: if (root._pendingCalls === 0) root.refresh()
+  }
+
+  Component.onCompleted: {
+    ensureDirProc.running = true
+    Qt.callLater(function() { configFile.reload() })
+  }
+}

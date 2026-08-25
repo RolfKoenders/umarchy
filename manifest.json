@@ -1,0 +1,20 @@
+{
+  "schemaVersion": 1,
+  "id": "io.github.rolfkoenders.umarchy",
+  "name": "Umarchy",
+  "version": "0.1.0",
+  "author": "Rolf Koenders",
+  "license": "MIT",
+  "description": "Umami analytics stats in the Omarchy bar: live visitors, pageviews, top pages/referrers/countries, switchable across sites.",
+  "kinds": ["bar-widget"],
+  "entryPoints": {
+    "barWidget": "Panel.qml"
+  },
+  "barWidget": {
+    "displayName": "Umarchy",
+    "description": "Umami analytics: live visitors, pageviews and top lists",
+    "category": "Info",
+    "allowMultiple": false,
+    "defaultSection": "right"
+  }
+}
