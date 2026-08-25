@@ -12,7 +12,18 @@ Item {
   id: root
 
   readonly property string home: Quickshell.env("HOME")
-  readonly property string stateDir: home + "/.local/state/omarchy/settings"
+  // A dedicated, guaranteed-0700 directory rather than the shared
+  // .../settings/ directory other plugins also write into (security review
+  // HANCORE-linux/omarchy-plugin-marketplace#2459, second round): sequencing
+  // chmod off onSaved closed the ordering race, but the file still exists at
+  // its default creation mode for the moment between creation and chmod,
+  // and mkdir -p alone never restricts an already-existing shared directory.
+  // A 0700 directory makes the file's own mode moot for cross-user exposure
+  // — nothing else can even traverse in to open it by path — which is the
+  // fix the review named as sufficient on its own ("or place it in a
+  // guaranteed mode-0700 directory"), without needing to solve atomic
+  // file creation with a non-default initial mode.
+  readonly property string stateDir: home + "/.local/state/omarchy/settings/io.github.rolfkoenders.umarchy"
   readonly property string configPath: stateDir + "/umarchy.json"
   readonly property string tokenPath: stateDir + "/umarchy-token.json"
 
@@ -309,23 +320,54 @@ Item {
     }
   }
 
-  Process { id: ensureDirProc; command: ["mkdir", "-p", root.stateDir]; running: false }
+  // mkdir, then chmod 700 the directory, then (only then) load the config —
+  // the directory is guaranteed private before anything is ever written
+  // into or read from it, every time the plugin starts, whether the
+  // directory is brand new or already existed from an earlier version.
+  Process {
+    id: ensureDirProc
+    command: ["mkdir", "-p", root.stateDir]
+    running: false
+    onExited: function(exitCode) {
+      if (exitCode !== 0) { root.lastError = "Could not create the settings directory"; return }
+      chmodDirProc.running = true
+    }
+  }
+  Process {
+    id: chmodDirProc
+    command: ["chmod", "700", root.stateDir]
+    running: false
+    onExited: function(exitCode) {
+      if (exitCode !== 0) root.lastError = "Could not secure the settings directory"
+      configFile.reload()
+    }
+  }
 
   // Only _writingConfig/_writingToken's clearing is sequenced off these
   // (onExited), not their start — chmod itself is only ever started from
   // configFile/tokenFile's onSaved below, once the write it's protecting
-  // has actually finished.
+  // has actually finished. exitCode is checked (review finding: both
+  // handlers used to clear the write guard unconditionally, silently
+  // treating a failed chmod the same as a successful one) — a failure is
+  // surfaced as lastError rather than swallowed, matching how a failed
+  // save (onSaveFailed) is already treated.
   Process {
     id: chmodConfigProc
     command: ["chmod", "600", root.configPath]
     running: false
-    onExited: root._writingConfig = false
+    onExited: function(exitCode) {
+      if (exitCode !== 0) root.lastError = "Could not secure the settings file"
+      root._writingConfig = false
+    }
   }
   Process {
     id: chmodTokenProc
     command: ["chmod", "600", root.tokenPath]
     running: false
-    onExited: root._writingToken = false
+    onExited: function(exitCode) {
+      if (exitCode !== 0) root.lastError = "Could not secure the session token file"
+      root._writingToken = false
+    }
   }
 
   property FileView configFile: FileView {
@@ -407,8 +449,10 @@ Item {
     onTriggered: if (root._pendingCalls === 0) root.refresh()
   }
 
+  // configFile.reload() now happens at the end of the mkdir -> chmod 700
+  // chain above (chmodDirProc.onExited), not here directly — the directory
+  // must be confirmed private before any file inside it is ever read.
   Component.onCompleted: {
     ensureDirProc.running = true
-    Qt.callLater(function() { configFile.reload() })
   }
 }

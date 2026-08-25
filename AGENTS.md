@@ -35,8 +35,10 @@ checkout.
 - `Model.js` — pure config/period/response-shaping/formatting logic.
 - `bin/umami-api` — the only thing that ever makes an HTTP request.
 
-State lives in two files, both under `~/.local/state/omarchy/settings/`,
-chmod 600, written only by `Service.qml`'s own `persist()`/`persistToken()`:
+State lives in two files, both chmod 600, in a dedicated directory
+(`~/.local/state/omarchy/settings/io.github.rolfkoenders.umarchy/`, chmod
+700 — not the shared `settings/` directory other plugins also write into),
+written only by `Service.qml`'s own `persist()`/`persistToken()`:
 `umarchy.json` (host/username/siteId/period/icon — never the password) and
 `umarchy-token.json` (the cached session token, keyed to host+username so a
 stale one for a different account is never reused).
@@ -82,6 +84,20 @@ process before any check can run.
   settings fields back to the last-saved value on every keystroke. Confirmed
   live: this broke typing in the host/username fields (password was
   unaffected — it has no such binding).
+- **Sequencing chmod off `onSaved` doesn't close the exposure window by
+  itself.** The first fix (chmod only starting from `FileView.onSaved`,
+  never racing the write) was still not enough per marketplace review
+  round 2 (`HANCORE-linux/omarchy-plugin-marketplace#2459`): the file still
+  exists at its default creation mode for the moment between creation and
+  chmod, and `mkdir -p` never restricts an already-existing directory's
+  permissions. Fixed by giving the plugin its own dedicated 0700 directory
+  (`chmod 700` sequenced right after `mkdir -p`, before the config is ever
+  loaded) — that makes the file's own mode moot for cross-user exposure,
+  which the review named as a sufficient fix on its own. Also fix, from the
+  same round: check `exitCode` in every chmod `Process`'s `onExited` and
+  surface a failure via `lastError` — clearing the write guard
+  unconditionally silently treats a failed chmod the same as a successful
+  one. See `tests/test_state_dir_permissions.qml`.
 - **Quickshell's `Process` has no `exitCode` property**, only an
   `exited(exitCode, exitStatus)` signal (confirmed against
   `quickshell-io.qmltypes`). Reading a bare `exitCode` inside
@@ -104,15 +120,24 @@ process before any check can run.
 ## Verification
 
 ```bash
-python3 tests/test_umami_api.py   # unit + real-local-HTTP-server integration tests
-node tests/test_model.js          # Model.js unit tests
+python3 tests/test_umami_api.py                    # unit + real-local-HTTP-server integration tests
+node tests/test_model.js                           # Model.js unit tests
+quickshell -p tests/test_state_dir_permissions.qml # state dir/file permission sequencing, real Quickshell engine
 omarchy plugin validate .
 ```
 
-QML-only glue (`RequestBridge.qml`'s process/stdio wiring,
-`CredentialManager.qml`'s `secret-tool` wrapper) isn't unit tested — verify
-it against a real Quickshell engine and the actual installed plugin instead,
-the same limitation Keeply's own review left in place.
+`RequestBridge.qml`'s process/stdio wiring and `CredentialManager.qml`'s
+`secret-tool` wrapper aren't unit tested — verify those against a real
+Quickshell engine and the actual installed plugin instead, the same
+limitation Keeply's own review left in place. The directory/file permission
+sequencing in `Service.qml` *is* covered, by
+`tests/test_state_dir_permissions.qml` — a standalone harness (not
+`Service.qml` loaded directly, since its sibling types resolve via
+Quickshell's directory-based QML lookup, which only works from inside the
+plugin directory) that re-creates the same `mkdir` → `chmod` → write →
+`chmod` sequence against a real scratch directory and verifies the result
+independently via `stat`, run with `quickshell -p` (bare `qml6` can't even
+instantiate Quickshell's `Process` type).
 
 ## Releases
 

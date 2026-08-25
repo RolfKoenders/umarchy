@@ -26,6 +26,12 @@ jobs:
       - name: Pure JS module (config/period/response-shaping/auth-retry logic)
         run: node tests/test_model.js
 
+      - name: State directory/file permission sequencing (real Quickshell engine) when available on the runner
+        run: |
+          if command -v quickshell >/dev/null; then
+            quickshell -p tests/test_state_dir_permissions.qml
+          fi
+
       - name: QML house style (fonts, palette, text format)
         run: |
           if command -v python3 >/dev/null; then
