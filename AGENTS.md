@@ -1,0 +1,124 @@
+# Umarchy
+
+## Project overview
+
+This repository is an Omarchy Quickshell bar-widget plugin showing stats
+from a self-hosted Umami analytics instance: live visitors, pageviews,
+bounce rate, average visit time, a pageviews-over-time chart, and top
+pages/referrers/countries, switchable between every site the account can
+see. Umami's API is called from a short-lived Python helper process
+(`bin/umami-api`), never from QML directly.
+
+Canonical public repository: `https://github.com/RolfKoenders/umarchy`.
+
+## Local development
+
+```bash
+plugin_target="$HOME/.config/omarchy/plugins/io.github.rolfkoenders.umarchy"
+mkdir -p "$plugin_target"
+cp -a -- "$PWD/." "$plugin_target/"
+omarchy-shell shell rescanPlugins
+omarchy plugin enable io.github.rolfkoenders.umarchy --section right
+omarchy restart shell
+```
+
+After editing a file, re-copy it into `$plugin_target` and
+`omarchy restart shell` again — this plugin is not run from a symlinked
+checkout.
+
+## Architecture
+
+- `Panel.qml` — bar icon, site tabs, hero/stats/chart/top-lists, settings.
+- `Service.qml` — config, login and 401-retry state machine, refresh timer.
+- `RequestBridge.qml` — spawns one `bin/umami-api` process per API call.
+- `CredentialManager.qml` — `secret-tool` wrapper for the login password.
+- `Model.js` — pure config/period/response-shaping/formatting logic.
+- `bin/umami-api` — the only thing that ever makes an HTTP request.
+
+State lives in two files, both under `~/.local/state/omarchy/settings/`,
+chmod 600, written only by `Service.qml`'s own `persist()`/`persistToken()`:
+`umarchy.json` (host/username/siteId/period/icon — never the password) and
+`umarchy-token.json` (the cached session token, keyed to host+username so a
+stale one for a different account is never reused).
+
+## Security model
+
+This follows the pattern from Keeply's marketplace security review
+(`HANCORE-linux/omarchy-plugin-marketplace#1750`), which went through
+several rounds specifically over QML's `XMLHttpRequest` and Quickshell's
+`StdioCollector` both accumulating unbounded data into the long-lived shell
+process before any check can run.
+
+- Every Umami API call, including login, happens in `bin/umami-api`: one
+  HTTP call per short-lived Python process, `read_capped()` enforcing a
+  byte cap and a wall-clock deadline *during the socket read itself* (not
+  after), `_NoRedirectHandler` refusing to follow any redirect. The
+  wall-clock deadline only works because `read_capped()` reads one byte at
+  a time — a larger chunk size lets a slow-but-steady drip keep a single
+  `resp.read(n)` call blocked for the whole response regardless of the
+  deadline, confirmed empirically while building this (see the comment
+  above `read_capped()`).
+- `RequestBridge.qml` reads the helper's stdout/stderr via
+  `SplitParser { splitMarker: "" }` with manual accumulate-and-cap logic,
+  not Quickshell's `StdioCollector`, which accumulates without any bound.
+- `CredentialManager.qml` uses the same capped-SplitParser pattern for
+  `secret-tool lookup` output.
+- The password is never in the config file, never on any process's argv,
+  and only ever enters via stdin (from the settings password field to the
+  helper's stdin) or `secret-tool store`'s stdin.
+- The instance host is validated as a plain `http(s)://host` in both
+  `Model.normalizeHost()` (QML side, gates what's saved and what the
+  "open in browser" action can open) and `bin/umami-api`'s own
+  `validate_host()` (defense in depth, in case the two ever drift).
+
+## Gotchas found the hard way
+
+- **Don't chmod on every `FileView.onLoaded`.** Only chmod right after
+  `persist()`/`persistToken()` actually write, matching
+  `omarchy-matomo/Service.qml`'s `chmodProc` usage. Chmodding on every load
+  (even the load `persist()` itself triggers) touches the file's metadata,
+  which the watcher can react to, causing `configFile` to reload right
+  after every save and reassert every `text: stats.config.x` binding on the
+  settings fields back to the last-saved value on every keystroke. Confirmed
+  live: this broke typing in the host/username fields (password was
+  unaffected — it has no such binding).
+- **Quickshell's `Process` has no `exitCode` property**, only an
+  `exited(exitCode, exitStatus)` signal (confirmed against
+  `quickshell-io.qmltypes`). Reading a bare `exitCode` inside
+  `onRunningChanged` throws `ReferenceError`.
+- **`MouseArea.onEntered` carries no `mouse` parameter** — only
+  `onPositionChanged`/`onClicked`/`onPressed` do. Use the area's own
+  `mouseX`/`mouseY` instead. (This one was already present in
+  `omarchy-matomo/Sparkline.qml`, not introduced here — worth a look if
+  that repo has the same bug.)
+- **`GET /api/websites` is a paginated envelope**
+  (`{data, count, page, pageSize}`), not a bare array — confirmed against
+  docs.umami.is and the live API. `Model.parseSites()` unwraps `.data`;
+  request `?pageSize=100` so an account with more than the default 10 sites
+  doesn't get silently truncated.
+- Avoid ES2015+ syntax not confirmed present in every QML JS engine version
+  in play (e.g. array spread `[...x]`) — use `.concat()` instead. No arrow
+  functions, template literals, or `const`/`let` anywhere in this repo,
+  matching the rest of the ecosystem's QML files.
+
+## Verification
+
+```bash
+python3 tests/test_umami_api.py   # unit + real-local-HTTP-server integration tests
+node tests/test_model.js          # Model.js unit tests
+omarchy plugin validate .
+```
+
+QML-only glue (`RequestBridge.qml`'s process/stdio wiring,
+`CredentialManager.qml`'s `secret-tool` wrapper) isn't unit tested — verify
+it against a real Quickshell engine and the actual installed plugin instead,
+the same limitation Keeply's own review left in place.
+
+## Releases
+
+Bump `manifest.json`'s `version` (semver: patch for fixes, minor for
+features) as part of any user-facing change. `.github/workflows/release.yml`
+watches pushes to `main` and publishes a tagged GitHub release with
+auto-generated notes the moment it sees a version that isn't tagged yet —
+nothing else to do once the bump lands. Docs/CI-only changes shouldn't bump
+the version; the workflow no-ops cleanly when nothing changed.

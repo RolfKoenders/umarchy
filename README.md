@@ -82,38 +82,12 @@ these settings.
   saved or ever used, including for the "open in browser" action, which only
   ever opens that saved URL — never anything server-supplied.
 
-This design follows the pattern from Keeply's own marketplace security
-review (`HANCORE-linux/omarchy-plugin-marketplace#1750`), which went through
-several rounds specifically over this class of issue.
-
 ## Requirements
 
 - Omarchy Quattro v4.
 - `python3` (stdlib only — no pip dependencies).
 - `secret-tool` (GNOME Keyring) for password storage.
 - A reachable Umami instance and a view-only account on it.
-
-## Development
-
-```bash
-python3 tests/test_umami_api.py   # unit + real-local-HTTP-server integration tests
-node tests/test_model.js          # Model.js unit tests
-omarchy plugin validate .
-```
-
-QML-only glue (`RequestBridge.qml`'s process/stdio wiring,
-`CredentialManager.qml`'s `secret-tool` wrapper) isn't unit tested — it's
-verified against a real Quickshell engine and the actual installed plugin
-instead, the same limitation Keeply's own review left in place.
-
-## Architecture
-
-- `Panel.qml` — bar icon, site tabs, hero/stats/chart/top-lists, settings.
-- `Service.qml` — config, login and 401-retry state machine, refresh timer.
-- `RequestBridge.qml` — spawns one `bin/umami-api` process per API call.
-- `CredentialManager.qml` — `secret-tool` wrapper for the login password.
-- `Model.js` — pure config/period/response-shaping/formatting logic.
-- `bin/umami-api` — the only thing that ever makes an HTTP request.
 
 ## License
 
