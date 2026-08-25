@@ -2,7 +2,7 @@
   "schemaVersion": 1,
   "id": "io.github.rolfkoenders.umarchy",
   "name": "Umarchy",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "author": "Rolf Koenders",
   "license": "MIT",
   "description": "Umami analytics stats in the Omarchy bar: live visitors, pageviews, top pages/referrers/countries, switchable across sites.",

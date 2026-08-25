@@ -273,21 +273,23 @@ Item {
     root.persist({ showLiveCount: enabled !== false })
   }
 
+  // chmod is sequenced off FileView's own "saved" signal in configFile/
+  // tokenFile below, not fired here — see the comment there for why.
+  // The state directory itself is only ensured once, at startup
+  // (Component.onCompleted): by the time any persist() can run, a real
+  // user interaction has already happened, which is ample time for a
+  // plain `mkdir -p` to have completed.
   function persist(values) {
     root.config = Model.patchConfig(root.config, values)
     root._writingConfig = true
-    ensureDirProc.running = true
     configFile.setText(Model.serializeConfig(root.config))
-    chmodConfigProc.running = true
   }
 
   function persistToken() {
     root._writingToken = true
-    ensureDirProc.running = true
     tokenFile.setText(JSON.stringify({
       token: root.token, host: root.config.host, username: root.config.username
     }, null, 2) + "\n")
-    chmodTokenProc.running = true
   }
 
   RequestBridge { id: requestBridge }
@@ -308,27 +310,54 @@ Item {
   }
 
   Process { id: ensureDirProc; command: ["mkdir", "-p", root.stateDir]; running: false }
-  Process { id: chmodConfigProc; command: ["chmod", "600", root.configPath]; running: false }
-  Process { id: chmodTokenProc; command: ["chmod", "600", root.tokenPath]; running: false }
+
+  // Only _writingConfig/_writingToken's clearing is sequenced off these
+  // (onExited), not their start — chmod itself is only ever started from
+  // configFile/tokenFile's onSaved below, once the write it's protecting
+  // has actually finished.
+  Process {
+    id: chmodConfigProc
+    command: ["chmod", "600", root.configPath]
+    running: false
+    onExited: root._writingConfig = false
+  }
+  Process {
+    id: chmodTokenProc
+    command: ["chmod", "600", root.tokenPath]
+    running: false
+    onExited: root._writingToken = false
+  }
 
   property FileView configFile: FileView {
     path: root.configPath
     watchChanges: true
     atomicWrites: true
     printErrors: false
-    onFileChanged: reload()
+    // Security review finding (HANCORE-linux/omarchy-plugin-marketplace#2459):
+    // mkdir, setText(), and chmod used to fire in the same tick with no
+    // ordering guarantee, so the credential-bearing file could briefly (or
+    // permanently, if chmod lost the race or failed) sit at its default
+    // creation mode. Fixed by only ever starting chmod from onSaved, once
+    // the write it's protecting has actually finished — confirmed against
+    // Quickshell's own qmltypes that FileView has real saved/saveFailed
+    // signals for exactly this.
+    //
+    // _writingConfig now stays true for the whole write+chmod window, not
+    // just the write: onFileChanged ignores every change while it's set
+    // (both the write and the chmod touch the watched file), and it's only
+    // cleared once chmod's own onExited fires (see the Process below) — or
+    // immediately, on onSaveFailed, since there's then nothing to chmod.
+    // Clearing it any earlier (e.g. back in onLoaded, as before) left a
+    // narrow window where chmod's own metadata touch could trigger a second,
+    // unguarded reload.
+    onFileChanged: {
+      if (root._writingConfig) return
+      reload()
+    }
+    onSaved: chmodConfigProc.running = true
+    onSaveFailed: root._writingConfig = false
     onLoaded: {
-      // No chmod here: chmod-on-every-load, if the file watcher below
-      // reacts to the metadata touch (not just content), reloads the
-      // config right after every persist() — including the one persist()
-      // does on its OWN write — reasserting `root.config` and, with it,
-      // every `text: stats.config.x` binding on the settings fields. That
-      // snapped hostField/usernameField back to the last-saved (empty)
-      // value after every single keystroke (confirmed live: passwordField,
-      // which has no such binding, was unaffected). chmod only belongs
-      // right after persist() actually writes, matching
-      // omarchy-matomo/Service.qml's chmodProc usage.
-      if (root._writingConfig) { root._writingConfig = false; return }
+      if (root._writingConfig) return
       root.config = Model.parseConfig(text())
       if (root.ready) {
         credentialManager.lookup(root.config.host, root.config.username)
@@ -349,12 +378,14 @@ Item {
     watchChanges: false
     atomicWrites: true
     printErrors: false
+    // Same fix as configFile above: chmod only starts from onSaved, once
+    // the write has actually finished, not fired unsequenced alongside it.
+    // No onFileChanged race to worry about here (watchChanges is false),
+    // so _writingToken only needs to survive until chmod's onExited.
+    onSaved: chmodTokenProc.running = true
+    onSaveFailed: root._writingToken = false
     onLoaded: {
-      // chmod happens in persistToken() only, same reasoning as configFile
-      // above — not strictly necessary here since watchChanges is false for
-      // this file, but kept consistent rather than leaving a second copy of
-      // the pattern that looks like it could reintroduce the same bug.
-      if (root._writingToken) { root._writingToken = false; return }
+      if (root._writingToken) return
       try {
         var data = JSON.parse(text() || "{}")
         if (data && data.host === root.config.host && data.username === root.config.username && data.token) {
