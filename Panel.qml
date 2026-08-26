@@ -250,7 +250,7 @@ Panel {
     bar: root.bar
     open: root.opened
     focusTarget: keyCatcher
-    contentWidth: panel.fittedContentWidth(Style.space(420))
+    contentWidth: panel.fittedContentWidth(Style.space(640))
     contentHeight: panel.fittedContentHeight(body.implicitHeight)
 
     PanelKeyCatcher {
@@ -517,9 +517,16 @@ Panel {
               }
             }
 
-            TopList { title: "TOP PAGES"; rows: stats.topPages }
-            TopList { title: "TOP REFERRERS"; rows: stats.topReferrers }
-            TopList { title: "TOP COUNTRIES"; rows: stats.topCountries }
+            Row {
+              width: parent.width
+              spacing: Style.spacing.huge
+
+              readonly property real columnWidth: (width - 2 * spacing) / 3
+
+              TopList { width: parent.columnWidth; title: "TOP PAGES"; rows: stats.topPages }
+              TopList { width: parent.columnWidth; title: "TOP REFERRERS"; rows: stats.topReferrers }
+              TopList { width: parent.columnWidth; title: "TOP COUNTRIES"; rows: stats.topCountries }
+            }
           }
         }
       }

@@ -29,6 +29,7 @@ Item {
 
   property var config: Model.emptyConfig()
   property string token: ""
+  property string timezone: ""
   property string _cachedPassword: ""
   property bool hasStoredPassword: false
 
@@ -129,8 +130,16 @@ Item {
       if (!err) root.summary = Model.parseStats(result)
       done(err)
     })
-    root.authorizedRequest("GET", base + "/pageviews" + qs + "&unit=" + range.unit, null, function(result, err) {
-      if (!err) root.series = Model.parsePageviewSeries(result)
+    var pageviewsQs = qs + "&unit=" + range.unit
+    // Umami buckets "day" units at UTC midnight unless told otherwise, which
+    // almost never matches the visitor's own calendar day. Passing the
+    // local IANA zone (looked up once via timedatectl, see timezoneProc)
+    // makes the bucket boundaries match the date labels Model.js prints for
+    // them. If the lookup hasn't resolved yet (or failed), the request
+    // simply omits it — Umami's own UTC default, no worse than before.
+    if (root.timezone) pageviewsQs += "&timezone=" + encodeURIComponent(root.timezone)
+    root.authorizedRequest("GET", base + "/pageviews" + pageviewsQs, null, function(result, err) {
+      if (!err) root.series = Model.parsePageviewSeries(result, range.unit)
       done(err)
     })
     root.authorizedRequest("GET", base + "/metrics" + qs + "&type=path", null, function(result, err) {
@@ -343,6 +352,25 @@ Item {
     }
   }
 
+  // Best-effort local timezone lookup, independent of the state-dir chain
+  // above (nothing it does depends on the config file). A failed or missing
+  // timedatectl just leaves root.timezone "" and the pageviews request omits
+  // the param, matching this plugin's previous (UTC-bucketed) behavior — not
+  // a regression, only a missed improvement. The value is sanity-checked
+  // before ever being used in a request, matching how the host is validated
+  // before use elsewhere in this file.
+  Process {
+    id: timezoneProc
+    command: ["timedatectl", "show", "--property=Timezone", "--value"]
+    running: false
+    stdout: StdioCollector { id: timezoneOut; waitForEnd: true }
+    onExited: function(exitCode) {
+      if (exitCode !== 0) return
+      var value = timezoneOut.text.replace(/^\s+|\s+$/g, "")
+      if (/^[A-Za-z0-9_+\-\/]{1,64}$/.test(value)) root.timezone = value
+    }
+  }
+
   // Only _writingConfig/_writingToken's clearing is sequenced off these
   // (onExited), not their start — chmod itself is only ever started from
   // configFile/tokenFile's onSaved below, once the write it's protecting
@@ -454,5 +482,6 @@ Item {
   // must be confirmed private before any file inside it is ever read.
   Component.onCompleted: {
     ensureDirProc.running = true
+    timezoneProc.running = true
   }
 }

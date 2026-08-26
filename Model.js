@@ -176,7 +176,15 @@ function metricValue(field) {
   return numberValue(field.value)
 }
 
-function parsePageviewSeries(raw) {
+// unit: the period's bucket granularity ("day" or "hour", see PERIODS)
+// determines the label format directly — it must NOT be guessed from
+// whether a timestamp happens to land on local midnight. Umami buckets
+// "day" units at UTC midnight, and converting that instant to any
+// non-UTC local time almost never lands back on local midnight (e.g.
+// UTC+2 puts every single day-bucket at 2am local), so a
+// guess-from-local-midnight heuristic silently mislabels every point in
+// the series as an hour instead of a date.
+function parsePageviewSeries(raw, unit) {
   var data = asJson(raw)
   if (!data || typeof data !== "object" || !Array.isArray(data.pageviews)) return []
   var rows = data.pageviews.slice(0, MAX_SERIES_POINTS)
@@ -184,18 +192,17 @@ function parsePageviewSeries(raw) {
   for (var i = 0; i < rows.length; i++) {
     var row = rows[i]
     if (!row) continue
-    out.push({ label: seriesLabel(row.x), value: numberValue(row.y) })
+    out.push({ label: seriesLabel(row.x, unit), value: numberValue(row.y) })
   }
   return out
 }
 
-function seriesLabel(x) {
+function seriesLabel(x, unit) {
   var n = Number(x)
   var date = isFinite(n) ? new Date(n) : new Date(String(x || ""))
   if (isNaN(date.getTime())) return ""
+  if (unit === "day") return shortDateLabel(date)
   var hh = date.getHours()
-  var isMidnight = hh === 0 && date.getMinutes() === 0
-  if (isMidnight) return shortDateLabel(date)
   var h12 = ((hh % 12) + 12) % 12
   if (h12 === 0) h12 = 12
   return h12 + (hh < 12 ? "a" : "p")

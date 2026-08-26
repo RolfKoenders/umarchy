@@ -200,6 +200,52 @@ function run_parse_pageview_series_caps_points() {
   check("series is capped, not unbounded", series.length < 1000 && series.length > 0);
 }
 
+// Regression test for a live bug report: the sparkline's x-axis showed the
+// same "2a" label for every single day-bucket in a 7d/30d chart. Root cause:
+// Umami buckets "day" units at UTC midnight, and the old label logic decided
+// date-vs-hour formatting by checking whether the *local* hour was
+// midnight — which UTC midnight almost never is outside UTC+0. In a
+// UTC+2 timezone (e.g. Europe/Amsterdam in August), every UTC-midnight
+// bucket converts to 2am local, so every point silently fell through to the
+// hour-format branch instead of the intended date branch. The fix decides
+// the format directly from the period's unit ("day" vs "hour"), never from
+// the timestamp's local wall-clock time.
+function run_parse_pageview_series_day_unit_uses_date_labels_regardless_of_local_timezone() {
+  const Model = loadModel();
+  const originalTz = process.env.TZ;
+  process.env.TZ = "Europe/Amsterdam"; // UTC+2 in August — the reported case
+  try {
+    const rows = [
+      { x: "2026-08-19T00:00:00Z", y: 2 },
+      { x: "2026-08-20T00:00:00Z", y: 6 },
+      { x: "2026-08-24T00:00:00Z", y: 26 },
+      { x: "2026-08-25T00:00:00Z", y: 11 }
+    ];
+    const series = Model.parsePageviewSeries({ pageviews: rows }, "day");
+    const labels = series.map(function(point) { return point.label; });
+    check("every day-bucket label looks like a date, not an hour", labels.every(function(label) {
+      return /^[A-Za-z]{3} \d{1,2}$/.test(label);
+    }));
+    const distinct = labels.filter(function(label, i) { return labels.indexOf(label) === i; });
+    check("day-bucket labels are distinct across different days (not all collapsed to one)", distinct.length === labels.length);
+  } finally {
+    process.env.TZ = originalTz;
+  }
+}
+
+function run_parse_pageview_series_hour_unit_still_uses_hour_labels() {
+  const Model = loadModel();
+  const originalTz = process.env.TZ;
+  process.env.TZ = "Europe/Amsterdam";
+  try {
+    const rows = [{ x: "2026-08-25T10:00:00Z", y: 4 }]; // noon local (UTC+2)
+    const series = Model.parsePageviewSeries({ pageviews: rows }, "hour");
+    check("hour-bucket label still uses hour/am-pm format", series[0].label === "12p");
+  } finally {
+    process.env.TZ = originalTz;
+  }
+}
+
 function run_parse_metric_rows_caps_count_and_field_length() {
   const Model = loadModel();
   const rows = [];
@@ -299,6 +345,8 @@ const runners = [
   run_parse_stats_extracts_value_fields,
   run_parse_stats_handles_missing_data,
   run_parse_pageview_series_caps_points,
+  run_parse_pageview_series_day_unit_uses_date_labels_regardless_of_local_timezone,
+  run_parse_pageview_series_hour_unit_still_uses_hour_labels,
   run_parse_metric_rows_caps_count_and_field_length,
   run_parse_metric_rows_direct_fallback,
   run_parse_active_visitors_both_shapes,

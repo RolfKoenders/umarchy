@@ -112,6 +112,20 @@ process before any check can run.
   docs.umami.is and the live API. `Model.parseSites()` unwraps `.data`;
   request `?pageSize=100` so an account with more than the default 10 sites
   doesn't get silently truncated.
+- **Don't decide a chart label's format from whether a timestamp lands on
+  local midnight.** The sparkline's day-bucket axis labels all showed the
+  same hour (e.g. "2a, 2a, 2a") because Umami buckets `unit=day` series at
+  UTC midnight, and `new Date(x).getHours() === 0` is only true there for a
+  UTC+0 visitor — everyone else's "day bucket" lands on some other local
+  hour, every time, by the same fixed offset. Fixed by deciding the format
+  from the period's own `unit` (`"day"` vs `"hour"`, see `PERIODS`), never by
+  inspecting the parsed timestamp. Also added a best-effort `timezone=`
+  query param (via a `timedatectl` helper `Process`, `Intl` is not available
+  in this QML JS engine — confirmed empirically) so Umami's own day
+  boundaries line up with the visitor's actual calendar day, not just the
+  label text describing them. See the regression tests in `test_model.js`
+  that pin this to `Europe/Amsterdam` (UTC+2) specifically, since the bug is
+  invisible on a UTC-timezone CI runner.
 - Avoid ES2015+ syntax not confirmed present in every QML JS engine version
   in play (e.g. array spread `[...x]`) — use `.concat()` instead. No arrow
   functions, template literals, or `const`/`let` anywhere in this repo,
