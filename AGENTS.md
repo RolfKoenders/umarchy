@@ -98,6 +98,23 @@ process before any check can run.
   surface a failure via `lastError` — clearing the write guard
   unconditionally silently treats a failed chmod the same as a successful
   one. See `tests/test_state_dir_permissions.qml`.
+- **Checking `exitCode` and surfacing `lastError` isn't fail-closed by
+  itself — round 2's fix still fell through to using the state anyway.**
+  Marketplace review round 3 (`HANCORE-linux/omarchy-plugin-marketplace#2459`):
+  `chmodDirProc.onExited` recorded an error on a failed `chmod 700` but then
+  unconditionally called `configFile.reload()` regardless, so the plugin
+  went on reading and writing credential-bearing state inside a directory
+  whose private mode was never established. Likewise `chmodConfigProc`/
+  `chmodTokenProc.onExited` only cleared the write guard on failure, which
+  let every future `persist()`/`persistToken()` carry on as if the last
+  write had ended up private. Fixed with a single `root.stateBlocked` flag,
+  set by any of the three chmod handlers on a nonzero exit: the dir handler
+  returns before ever reaching `configFile.reload()`, and `persist()`/
+  `persistToken()` both refuse to run once it's set. There's no path that
+  clears it again — recovering means fixing the permission problem and
+  restarting the plugin. See `tests/test_state_dir_permissions.qml`'s
+  vanish-dir/vanish-file cases, which simulate a chmod that fails after its
+  target existed a moment earlier.
 - **Quickshell's `Process` has no `exitCode` property**, only an
   `exited(exitCode, exitStatus)` signal (confirmed against
   `quickshell-io.qmltypes`). Reading a bare `exitCode` inside
