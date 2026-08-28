@@ -55,6 +55,18 @@ Item {
   property bool _writingConfig: false
   property bool _writingToken: false
 
+  // Fail-closed gate for the whole state directory (security review
+  // HANCORE-linux/omarchy-plugin-marketplace#2459, third round): once true,
+  // persist()/persistToken() refuse to write and the dir-chmod handler below
+  // refuses to load the config at all. Set the moment ANY permission-setting
+  // step fails — the directory chmod, or either file's chmod — since a
+  // failure at any of those means the credential-bearing state can no
+  // longer be trusted to stay private, and continuing as usual would be
+  // exactly the "fail open" behavior the review flagged. There is no path
+  // that clears it again; recovering means fixing the underlying permission
+  // problem and restarting the plugin.
+  property bool stateBlocked: false
+
   readonly property bool ready: Model.hasConnectionTarget(config)
   readonly property var activeSiteObj: Model.activeSite(sites, config.siteId)
   readonly property string siteLabel: activeSiteObj ? activeSiteObj.name : ""
@@ -300,12 +312,14 @@ Item {
   // user interaction has already happened, which is ample time for a
   // plain `mkdir -p` to have completed.
   function persist(values) {
+    if (root.stateBlocked) return
     root.config = Model.patchConfig(root.config, values)
     root._writingConfig = true
     configFile.setText(Model.serializeConfig(root.config))
   }
 
   function persistToken() {
+    if (root.stateBlocked) return
     root._writingToken = true
     tokenFile.setText(JSON.stringify({
       token: root.token, host: root.config.host, username: root.config.username
@@ -347,7 +361,18 @@ Item {
     command: ["chmod", "700", root.stateDir]
     running: false
     onExited: function(exitCode) {
-      if (exitCode !== 0) root.lastError = "Could not secure the settings directory"
+      // Fail closed (security review round 3): a failed chmod here used to
+      // still fall through to configFile.reload(), so the plugin went on
+      // reading and later writing credential-bearing state into a directory
+      // whose private mode was never actually established. Returning here
+      // instead of reaching reload() means config/token never load and
+      // root.ready stays false, so nothing downstream can persist() into
+      // this directory either.
+      if (exitCode !== 0) {
+        root.lastError = "Could not secure the settings directory"
+        root.stateBlocked = true
+        return
+      }
       configFile.reload()
     }
   }
@@ -384,7 +409,16 @@ Item {
     command: ["chmod", "600", root.configPath]
     running: false
     onExited: function(exitCode) {
-      if (exitCode !== 0) root.lastError = "Could not secure the settings file"
+      // Fail closed (security review round 3): clearing the write guard is
+      // just bookkeeping for the FileView watcher, not an "all clear" — a
+      // failed chmod here means this write did NOT end up private, so
+      // stateBlocked is also set to refuse every future persist() rather
+      // than quietly carrying on as if the credential-bearing file were
+      // safely saved.
+      if (exitCode !== 0) {
+        root.lastError = "Could not secure the settings file"
+        root.stateBlocked = true
+      }
       root._writingConfig = false
     }
   }
@@ -393,7 +427,11 @@ Item {
     command: ["chmod", "600", root.tokenPath]
     running: false
     onExited: function(exitCode) {
-      if (exitCode !== 0) root.lastError = "Could not secure the session token file"
+      // Same fail-closed reasoning as chmodConfigProc above.
+      if (exitCode !== 0) {
+        root.lastError = "Could not secure the session token file"
+        root.stateBlocked = true
+      }
       root._writingToken = false
     }
   }
