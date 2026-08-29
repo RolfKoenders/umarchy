@@ -31,17 +31,24 @@ checkout.
 - `Panel.qml` — bar icon, site tabs, hero/stats/chart/top-lists, settings.
 - `Service.qml` — config, login and 401-retry state machine, refresh timer.
 - `RequestBridge.qml` — spawns one `bin/umami-api` process per API call.
+- `StateBridge.qml` — spawns one `bin/umami-state` process per state
+  read/write/ensure-dir call.
 - `CredentialManager.qml` — `secret-tool` wrapper for the login password.
 - `Model.js` — pure config/period/response-shaping/formatting logic.
 - `bin/umami-api` — the only thing that ever makes an HTTP request.
+- `bin/umami-state` — the only thing that ever touches the state
+  directory/files on disk.
 
 State lives in two files, both chmod 600, in a dedicated directory
 (`~/.local/state/omarchy/settings/io.github.rolfkoenders.umarchy/`, chmod
-700 — not the shared `settings/` directory other plugins also write into),
-written only by `Service.qml`'s own `persist()`/`persistToken()`:
+700 — not the shared `settings/` directory other plugins also write into):
 `umarchy.json` (host/username/siteId/period/icon — never the password) and
 `umarchy-token.json` (the cached session token, keyed to host+username so a
-stale one for a different account is never reused).
+stale one for a different account is never reused). Neither `Service.qml`
+nor any other QML file ever addresses these by a predictable path string —
+`bin/umami-state` (via `StateBridge.qml`) is the only thing that creates,
+reads, or writes them, and it does so through a descriptor-based walk that
+refuses to follow a symlink anywhere in the path (see Security model).
 
 ## Security model
 
@@ -72,49 +79,75 @@ process before any check can run.
   `Model.normalizeHost()` (QML side, gates what's saved and what the
   "open in browser" action can open) and `bin/umami-api`'s own
   `validate_host()` (defense in depth, in case the two ever drift).
+- The state directory and its two files are never addressed by a
+  predictable path string. `mkdir -p`/`chmod`-by-path both silently follow
+  a symlink planted at the target path, and a `FileView` opened by path has
+  no defense against a swapped-in FIFO or oversized file. `bin/umami-state`
+  instead walks from `$HOME` to the plugin's directory one path component
+  at a time, opening each with `O_NOFOLLOW | O_DIRECTORY` relative to the
+  previous component's own held file descriptor (`os.open(..., dir_fd=...)`)
+  — a symlink planted at any point, even in the exact instant between two
+  of its own syscalls, fails the next open rather than being silently
+  followed. The two files are opened the same way (`O_NOFOLLOW`), then
+  checked with `fstat()` for being a regular file owned by the current
+  user and under a byte cap, before anything is read from or written to
+  them. See its own docstring and
+  `HANCORE-linux/omarchy-plugin-marketplace#2459` (fourth round) for the
+  finding that produced this shape.
 
 ## Gotchas found the hard way
 
-- **Don't chmod on every `FileView.onLoaded`.** Only chmod right after
-  `persist()`/`persistToken()` actually write, matching
-  `omarchy-matomo/Service.qml`'s `chmodProc` usage. Chmodding on every load
-  (even the load `persist()` itself triggers) touches the file's metadata,
-  which the watcher can react to, causing `configFile` to reload right
-  after every save and reassert every `text: stats.config.x` binding on the
-  settings fields back to the last-saved value on every keystroke. Confirmed
-  live: this broke typing in the host/username fields (password was
-  unaffected — it has no such binding).
+The first three of these describe an `mkdir -p` + `chmod`-by-path +
+`FileView`-by-path approach that no longer exists in this codebase — kept
+as history for why the current `bin/umami-state` design (see Architecture
+and Security model) looks the way it does, through three rounds of the
+same reviewer finding the same underlying problem one layer deeper each
+time.
+
+- **Don't chmod on every `FileView.onLoaded`.** (Round 1.) Chmodding on
+  every load, back when config loading went through a `FileView`, touched
+  the file's metadata, which its own change-watcher reacted to, causing a
+  reload right after every save that reasserted every settings-field
+  binding back to the last-saved value on every keystroke. Confirmed live:
+  this broke typing in the host/username fields.
 - **Sequencing chmod off `onSaved` doesn't close the exposure window by
-  itself.** The first fix (chmod only starting from `FileView.onSaved`,
-  never racing the write) was still not enough per marketplace review
-  round 2 (`HANCORE-linux/omarchy-plugin-marketplace#2459`): the file still
-  exists at its default creation mode for the moment between creation and
-  chmod, and `mkdir -p` never restricts an already-existing directory's
-  permissions. Fixed by giving the plugin its own dedicated 0700 directory
-  (`chmod 700` sequenced right after `mkdir -p`, before the config is ever
-  loaded) — that makes the file's own mode moot for cross-user exposure,
-  which the review named as a sufficient fix on its own. Also fix, from the
-  same round: check `exitCode` in every chmod `Process`'s `onExited` and
-  surface a failure via `lastError` — clearing the write guard
-  unconditionally silently treats a failed chmod the same as a successful
-  one. See `tests/test_state_dir_permissions.qml`.
+  itself.** (Round 2.) The file still existed at its default creation mode
+  for the moment between creation and chmod, and `mkdir -p` never
+  restricted an already-existing directory's permissions. Also: clearing a
+  write-in-progress guard unconditionally in a chmod process's `onExited`
+  silently treated a failed chmod the same as a successful one.
 - **Checking `exitCode` and surfacing `lastError` isn't fail-closed by
-  itself — round 2's fix still fell through to using the state anyway.**
-  Marketplace review round 3 (`HANCORE-linux/omarchy-plugin-marketplace#2459`):
-  `chmodDirProc.onExited` recorded an error on a failed `chmod 700` but then
-  unconditionally called `configFile.reload()` regardless, so the plugin
-  went on reading and writing credential-bearing state inside a directory
-  whose private mode was never established. Likewise `chmodConfigProc`/
-  `chmodTokenProc.onExited` only cleared the write guard on failure, which
-  let every future `persist()`/`persistToken()` carry on as if the last
-  write had ended up private. Fixed with a single `root.stateBlocked` flag,
-  set by any of the three chmod handlers on a nonzero exit: the dir handler
-  returns before ever reaching `configFile.reload()`, and `persist()`/
-  `persistToken()` both refuse to run once it's set. There's no path that
-  clears it again — recovering means fixing the permission problem and
-  restarting the plugin. See `tests/test_state_dir_permissions.qml`'s
-  vanish-dir/vanish-file cases, which simulate a chmod that fails after its
-  target existed a moment earlier.
+  itself.** (Round 3.) The dir-chmod handler recorded an error on failure
+  but still went on to load the config anyway; the file-chmod handlers only
+  cleared their write guard, letting every future write carry on as if the
+  last one had ended up private.
+- **None of rounds 1–3 close the actual hole: a predictable path can have a
+  symlink planted at it before the plugin ever runs.** (Round 4.) `mkdir -p`
+  treats a symlink-to-a-directory as "already exists"; `chmod`-by-path and
+  `FileView`-by-path both resolve through a symlink transparently — so
+  rounds 1–3's fixes could all "succeed" against a directory or file an
+  attacker chose, not the one the plugin actually created, and none of them
+  defended against a pre-existing FIFO (blocks a read/write open forever)
+  or an oversized swapped-in file either. There's no way to get these
+  guarantees from QML's own file APIs, so the whole state
+  directory/file layer moved into `bin/umami-state`, which never resolves a
+  predictable path in one call — see Security model and
+  `tests/test_umami_state.py`, which plants each of these attacks for real
+  in a scratch `$HOME` (symlinked directory, symlinked file, FIFO,
+  oversized file) and confirms every one is refused.
+- **A `Process` with `stdinEnabled: true` doesn't send EOF just because
+  you're done calling `write()`.** `bin/umami-state`'s write command reads
+  a fixed-size-capped chunk of stdin (it can't use `readline()` — the JSON
+  payload itself contains real newlines), and that read only returns once
+  either the cap is hit or stdin reaches EOF. The first version of
+  `StateBridge.qml` wrote the payload and left `stdinEnabled` on, so the
+  helper sat blocked forever waiting for more input that was never coming
+  — confirmed live: `persist()` silently never wrote anything, and `ps`
+  still showed the helper process running minutes later. Toggling
+  `stdinEnabled` back to `false` right after `write()` is what actually
+  closes this process's end of the pipe and delivers the EOF. See
+  `tests/test_state_bridge_write.qml`, which fails with a timeout (not a
+  false pass) if this regresses.
 - **Quickshell's `Process` has no `exitCode` property**, only an
   `exited(exitCode, exitStatus)` signal (confirmed against
   `quickshell-io.qmltypes`). Reading a bare `exitCode` inside
@@ -151,24 +184,28 @@ process before any check can run.
 ## Verification
 
 ```bash
-python3 tests/test_umami_api.py                    # unit + real-local-HTTP-server integration tests
-node tests/test_model.js                           # Model.js unit tests
-quickshell -p tests/test_state_dir_permissions.qml # state dir/file permission sequencing, real Quickshell engine
+python3 tests/test_umami_api.py                   # unit + real-local-HTTP-server integration tests
+python3 tests/test_umami_state.py                 # unit + real symlink/FIFO/oversize attack integration tests
+node tests/test_model.js                          # Model.js unit tests
+quickshell -p tests/test_state_bridge_write.qml   # state write/EOF handoff, real Quickshell engine
 omarchy plugin validate .
 ```
 
-`RequestBridge.qml`'s process/stdio wiring and `CredentialManager.qml`'s
-`secret-tool` wrapper aren't unit tested — verify those against a real
-Quickshell engine and the actual installed plugin instead, the same
-limitation Keeply's own review left in place. The directory/file permission
-sequencing in `Service.qml` *is* covered, by
-`tests/test_state_dir_permissions.qml` — a standalone harness (not
-`Service.qml` loaded directly, since its sibling types resolve via
-Quickshell's directory-based QML lookup, which only works from inside the
-plugin directory) that re-creates the same `mkdir` → `chmod` → write →
-`chmod` sequence against a real scratch directory and verifies the result
-independently via `stat`, run with `quickshell -p` (bare `qml6` can't even
-instantiate Quickshell's `Process` type).
+`RequestBridge.qml`'s and `StateBridge.qml`'s process/stdio wiring, and
+`CredentialManager.qml`'s `secret-tool` wrapper, aren't unit tested —
+verify those against a real Quickshell engine and the actual installed
+plugin instead, the same limitation Keeply's own review left in place.
+`bin/umami-state`'s actual security logic (the no-follow directory walk,
+the symlink/FIFO/owner/size checks on the two files) *is* thoroughly
+covered by `tests/test_umami_state.py`, which plants each attack for real
+in a scratch `$HOME` rather than mocking anything. `StateBridge.qml`'s
+write-then-EOF handoff specifically also has its own real-Quickshell-engine
+test, `tests/test_state_bridge_write.qml` — a standalone harness (not
+`StateBridge.qml` loaded directly, since running it against the real
+`$HOME` from an automated test would overwrite this machine's actual
+config) that replicates the exact same mechanism against a scratch `$HOME`
+with a real `bin/umami-state` process, run with `quickshell -p` (bare
+`qml6` can't even instantiate Quickshell's `Process` type).
 
 ## Releases
 

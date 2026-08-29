@@ -1,5 +1,4 @@
 import QtQuick
-import Quickshell
 import Quickshell.Io
 import "Model.js" as Model
 
@@ -11,21 +10,14 @@ import "Model.js" as Model
 Item {
   id: root
 
-  readonly property string home: Quickshell.env("HOME")
-  // A dedicated, guaranteed-0700 directory rather than the shared
-  // .../settings/ directory other plugins also write into (security review
-  // HANCORE-linux/omarchy-plugin-marketplace#2459, second round): sequencing
-  // chmod off onSaved closed the ordering race, but the file still exists at
-  // its default creation mode for the moment between creation and chmod,
-  // and mkdir -p alone never restricts an already-existing shared directory.
-  // A 0700 directory makes the file's own mode moot for cross-user exposure
-  // — nothing else can even traverse in to open it by path — which is the
-  // fix the review named as sufficient on its own ("or place it in a
-  // guaranteed mode-0700 directory"), without needing to solve atomic
-  // file creation with a non-default initial mode.
-  readonly property string stateDir: home + "/.local/state/omarchy/settings/io.github.rolfkoenders.umarchy"
-  readonly property string configPath: stateDir + "/umarchy.json"
-  readonly property string tokenPath: stateDir + "/umarchy-token.json"
+  // The state directory/files are never addressed by a predictable path
+  // string from here — see StateBridge.qml and bin/umami-state for why
+  // (security review HANCORE-linux/omarchy-plugin-marketplace#2459, fourth
+  // round: mkdir -p and chmod-by-path both follow a symlink planted at that
+  // path, and FileView-by-path has no defense against a swapped-in FIFO or
+  // oversized file). Service.qml only ever deals with plain file *names*
+  // ("umarchy.json", "umarchy-token.json"); the helper resolves them
+  // relative to a directory it walked and verified itself.
 
   property var config: Model.emptyConfig()
   property string token: ""
@@ -52,19 +44,17 @@ Item {
   property bool _reauthInFlight: false
   property var _reauthQueue: []
 
-  property bool _writingConfig: false
-  property bool _writingToken: false
-
   // Fail-closed gate for the whole state directory (security review
-  // HANCORE-linux/omarchy-plugin-marketplace#2459, third round): once true,
-  // persist()/persistToken() refuse to write and the dir-chmod handler below
-  // refuses to load the config at all. Set the moment ANY permission-setting
-  // step fails — the directory chmod, or either file's chmod — since a
-  // failure at any of those means the credential-bearing state can no
-  // longer be trusted to stay private, and continuing as usual would be
-  // exactly the "fail open" behavior the review flagged. There is no path
-  // that clears it again; recovering means fixing the underlying permission
-  // problem and restarting the plugin.
+  // HANCORE-linux/omarchy-plugin-marketplace#2459, third and fourth
+  // rounds): once true, persist()/persistToken() refuse to write and
+  // loadConfig()/loadToken() refuse to use whatever they read. Set the
+  // moment bin/umami-state reports anything other than success or "not
+  // found yet" (its exit code 5) for any operation — a permission failure,
+  // an oversized file, or a security violation like a symlink or wrong file
+  // type — since none of those leave the credential-bearing state in a
+  // shape that's safe to keep using. There is no path that clears it
+  // again; recovering means fixing the underlying problem and restarting
+  // the plugin.
   property bool stateBlocked: false
 
   readonly property bool ready: Model.hasConnectionTarget(config)
@@ -305,75 +295,96 @@ Item {
     root.persist({ showLiveCount: enabled !== false })
   }
 
-  // chmod is sequenced off FileView's own "saved" signal in configFile/
-  // tokenFile below, not fired here — see the comment there for why.
-  // The state directory itself is only ensured once, at startup
-  // (Component.onCompleted): by the time any persist() can run, a real
-  // user interaction has already happened, which is ample time for a
-  // plain `mkdir -p` to have completed.
+  // Every write goes through bin/umami-state, which re-walks and
+  // re-verifies the state directory on every single call rather than
+  // trusting that a path checked out earlier still means the same thing
+  // now — there is no long-lived "directory handle" here to reuse or race.
   function persist(values) {
     if (root.stateBlocked) return
     root.config = Model.patchConfig(root.config, values)
-    root._writingConfig = true
-    configFile.setText(Model.serializeConfig(root.config))
+    stateBridge.write("umarchy.json", Model.serializeConfig(root.config), function(exitCode) {
+      if (exitCode !== 0) {
+        root.lastError = "Could not securely save the settings file"
+        root.stateBlocked = true
+      }
+    })
   }
 
   function persistToken() {
     if (root.stateBlocked) return
-    root._writingToken = true
-    tokenFile.setText(JSON.stringify({
+    var payload = JSON.stringify({
       token: root.token, host: root.config.host, username: root.config.username
-    }, null, 2) + "\n")
+    }, null, 2) + "\n"
+    stateBridge.write("umarchy-token.json", payload, function(exitCode) {
+      if (exitCode !== 0) {
+        root.lastError = "Could not securely save the session token file"
+        root.stateBlocked = true
+      }
+    })
+  }
+
+  // exitCode 0: parsed normally. 5: no file yet, a normal first run —
+  // config resets to empty, nothing else it touches on disk is trusted
+  // less because of that. Anything else (permission failure, oversized
+  // file, symlink/wrong-type/wrong-owner) is fail-closed: stop here rather
+  // than go on using content that failed a safety check.
+  function loadConfig() {
+    stateBridge.read("umarchy.json", function(exitCode, stdout) {
+      if (exitCode === 0) {
+        root.config = Model.parseConfig(stdout)
+      } else if (exitCode === 5) {
+        root.config = Model.emptyConfig()
+      } else {
+        root.lastError = "Could not read the settings file"
+        root.stateBlocked = true
+        return
+      }
+      if (root.ready) {
+        credentialManager.lookup(root.config.host, root.config.username)
+      }
+    })
+  }
+
+  // Only ever reached via credentialManager.onLookupFinished below, right
+  // after startup (or a fresh saveConnection()) — this always finishes by
+  // calling refresh(), which is the one thing that must happen exactly
+  // once after startup.
+  function loadToken() {
+    stateBridge.read("umarchy-token.json", function(exitCode, stdout) {
+      if (exitCode === 0) {
+        try {
+          var data = JSON.parse(stdout)
+          if (data && data.host === root.config.host && data.username === root.config.username && data.token) {
+            root.token = String(data.token)
+          }
+        } catch (e) {
+          // corrupt JSON, not a security violation -- an authorizedRequest
+          // 401 will trigger a fresh login as long as the password is in
+          // the keyring
+        }
+      } else if (exitCode !== 5) {
+        root.lastError = "Could not read the session token file"
+        root.stateBlocked = true
+        return
+      }
+      root.refresh()
+    })
   }
 
   RequestBridge { id: requestBridge }
   CredentialManager { id: credentialManager }
+  StateBridge { id: stateBridge }
 
   Connections {
     target: credentialManager
     function onLookupFinished(password) {
       root._cachedPassword = password
       root.hasStoredPassword = password !== ""
-      // Only ever reached via configFile.onLoaded below, right after
-      // startup or a config reload — chaining the token-cache read (which
-      // ends in refresh()) from here, rather than firing both in parallel,
-      // guarantees hasStoredPassword is already correct before the first
-      // request can possibly hit a 401 and need it.
-      tokenFile.reload()
-    }
-  }
-
-  // mkdir, then chmod 700 the directory, then (only then) load the config —
-  // the directory is guaranteed private before anything is ever written
-  // into or read from it, every time the plugin starts, whether the
-  // directory is brand new or already existed from an earlier version.
-  Process {
-    id: ensureDirProc
-    command: ["mkdir", "-p", root.stateDir]
-    running: false
-    onExited: function(exitCode) {
-      if (exitCode !== 0) { root.lastError = "Could not create the settings directory"; return }
-      chmodDirProc.running = true
-    }
-  }
-  Process {
-    id: chmodDirProc
-    command: ["chmod", "700", root.stateDir]
-    running: false
-    onExited: function(exitCode) {
-      // Fail closed (security review round 3): a failed chmod here used to
-      // still fall through to configFile.reload(), so the plugin went on
-      // reading and later writing credential-bearing state into a directory
-      // whose private mode was never actually established. Returning here
-      // instead of reaching reload() means config/token never load and
-      // root.ready stays false, so nothing downstream can persist() into
-      // this directory either.
-      if (exitCode !== 0) {
-        root.lastError = "Could not secure the settings directory"
-        root.stateBlocked = true
-        return
-      }
-      configFile.reload()
+      // Chaining the token-cache read (which ends in refresh()) from here,
+      // rather than firing both in parallel, guarantees hasStoredPassword
+      // is already correct before the first request can possibly hit a
+      // 401 and need it.
+      root.loadToken()
     }
   }
 
@@ -396,118 +407,6 @@ Item {
     }
   }
 
-  // Only _writingConfig/_writingToken's clearing is sequenced off these
-  // (onExited), not their start — chmod itself is only ever started from
-  // configFile/tokenFile's onSaved below, once the write it's protecting
-  // has actually finished. exitCode is checked (review finding: both
-  // handlers used to clear the write guard unconditionally, silently
-  // treating a failed chmod the same as a successful one) — a failure is
-  // surfaced as lastError rather than swallowed, matching how a failed
-  // save (onSaveFailed) is already treated.
-  Process {
-    id: chmodConfigProc
-    command: ["chmod", "600", root.configPath]
-    running: false
-    onExited: function(exitCode) {
-      // Fail closed (security review round 3): clearing the write guard is
-      // just bookkeeping for the FileView watcher, not an "all clear" — a
-      // failed chmod here means this write did NOT end up private, so
-      // stateBlocked is also set to refuse every future persist() rather
-      // than quietly carrying on as if the credential-bearing file were
-      // safely saved.
-      if (exitCode !== 0) {
-        root.lastError = "Could not secure the settings file"
-        root.stateBlocked = true
-      }
-      root._writingConfig = false
-    }
-  }
-  Process {
-    id: chmodTokenProc
-    command: ["chmod", "600", root.tokenPath]
-    running: false
-    onExited: function(exitCode) {
-      // Same fail-closed reasoning as chmodConfigProc above.
-      if (exitCode !== 0) {
-        root.lastError = "Could not secure the session token file"
-        root.stateBlocked = true
-      }
-      root._writingToken = false
-    }
-  }
-
-  property FileView configFile: FileView {
-    path: root.configPath
-    watchChanges: true
-    atomicWrites: true
-    printErrors: false
-    // Security review finding (HANCORE-linux/omarchy-plugin-marketplace#2459):
-    // mkdir, setText(), and chmod used to fire in the same tick with no
-    // ordering guarantee, so the credential-bearing file could briefly (or
-    // permanently, if chmod lost the race or failed) sit at its default
-    // creation mode. Fixed by only ever starting chmod from onSaved, once
-    // the write it's protecting has actually finished — confirmed against
-    // Quickshell's own qmltypes that FileView has real saved/saveFailed
-    // signals for exactly this.
-    //
-    // _writingConfig now stays true for the whole write+chmod window, not
-    // just the write: onFileChanged ignores every change while it's set
-    // (both the write and the chmod touch the watched file), and it's only
-    // cleared once chmod's own onExited fires (see the Process below) — or
-    // immediately, on onSaveFailed, since there's then nothing to chmod.
-    // Clearing it any earlier (e.g. back in onLoaded, as before) left a
-    // narrow window where chmod's own metadata touch could trigger a second,
-    // unguarded reload.
-    onFileChanged: {
-      if (root._writingConfig) return
-      reload()
-    }
-    onSaved: chmodConfigProc.running = true
-    onSaveFailed: root._writingConfig = false
-    onLoaded: {
-      if (root._writingConfig) return
-      root.config = Model.parseConfig(text())
-      if (root.ready) {
-        credentialManager.lookup(root.config.host, root.config.username)
-      }
-    }
-    onLoadFailed: {
-      root.config = Model.emptyConfig()
-    }
-  }
-
-  // Loaded only once config is known to be ready, so this never races
-  // config.host/username. Reads whatever cached token exists (there may be
-  // none yet, or one for a different account — either way this always
-  // finishes by calling refresh(), which is the one thing that must happen
-  // exactly once after startup).
-  property FileView tokenFile: FileView {
-    path: root.tokenPath
-    watchChanges: false
-    atomicWrites: true
-    printErrors: false
-    // Same fix as configFile above: chmod only starts from onSaved, once
-    // the write has actually finished, not fired unsequenced alongside it.
-    // No onFileChanged race to worry about here (watchChanges is false),
-    // so _writingToken only needs to survive until chmod's onExited.
-    onSaved: chmodTokenProc.running = true
-    onSaveFailed: root._writingToken = false
-    onLoaded: {
-      if (root._writingToken) return
-      try {
-        var data = JSON.parse(text() || "{}")
-        if (data && data.host === root.config.host && data.username === root.config.username && data.token) {
-          root.token = String(data.token)
-        }
-      } catch (e) {
-        // no usable cached token — fine, an authorizedRequest 401 will
-        // trigger a fresh login as long as the password is in the keyring
-      }
-      root.refresh()
-    }
-    onLoadFailed: root.refresh()
-  }
-
   Timer {
     interval: 60000
     running: root.ready
@@ -515,11 +414,15 @@ Item {
     onTriggered: if (root._pendingCalls === 0) root.refresh()
   }
 
-  // configFile.reload() now happens at the end of the mkdir -> chmod 700
-  // chain above (chmodDirProc.onExited), not here directly — the directory
-  // must be confirmed private before any file inside it is ever read.
   Component.onCompleted: {
-    ensureDirProc.running = true
+    stateBridge.ensureDir(function(exitCode) {
+      if (exitCode !== 0) {
+        root.lastError = "Could not secure the settings directory"
+        root.stateBlocked = true
+        return
+      }
+      root.loadConfig()
+    })
     timezoneProc.running = true
   }
 }

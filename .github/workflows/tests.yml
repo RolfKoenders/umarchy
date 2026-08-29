@@ -23,13 +23,16 @@ jobs:
       - name: Python API helper tests (unit + real-local-HTTP-server integration)
         run: python3 tests/test_umami_api.py
 
+      - name: Python state helper tests (unit + real symlink/FIFO/oversize attack integration)
+        run: python3 tests/test_umami_state.py
+
       - name: Pure JS module (config/period/response-shaping/auth-retry logic)
         run: node tests/test_model.js
 
-      - name: State directory/file permission sequencing (real Quickshell engine) when available on the runner
+      - name: State write/EOF handoff (real Quickshell engine) when available on the runner
         run: |
           if command -v quickshell >/dev/null; then
-            quickshell -p tests/test_state_dir_permissions.qml
+            timeout 30 quickshell -p tests/test_state_bridge_write.qml
           fi
 
       - name: QML house style (fonts, palette, text format)
@@ -43,12 +46,12 @@ jobs:
       - name: QML parser when available on the runner
         run: |
           if command -v qmlformat >/dev/null; then
-            for file in Panel.qml Service.qml RequestBridge.qml CredentialManager.qml Sparkline.qml; do
+            for file in Panel.qml Service.qml RequestBridge.qml StateBridge.qml CredentialManager.qml Sparkline.qml; do
               qmlformat "$file" >/dev/null
             done
           fi
           if command -v qmllint >/dev/null; then
-            for file in Panel.qml Service.qml RequestBridge.qml CredentialManager.qml Sparkline.qml; do
+            for file in Panel.qml Service.qml RequestBridge.qml StateBridge.qml CredentialManager.qml Sparkline.qml; do
               qmllint "$file"
             done
           fi

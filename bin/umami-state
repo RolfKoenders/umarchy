@@ -1,0 +1,213 @@
+#!/usr/bin/env python3
+"""Local state-file helper for the Umarchy Omarchy plugin.
+
+Creates/reads/writes the plugin's private state directory and the two JSON
+files inside it (config, cached session token) from a short-lived process,
+walking the path with a descriptor-based, symlink-refusing open at every
+component instead of resolving a predictable path string directly.
+
+Why: mkdir -p and chmod-by-path both follow an existing symlink at the
+target path silently -- mkdir -p treats a symlink-to-a-directory as
+"already exists", and chmod-by-path resolves through it, so both can be
+made to "succeed" against a directory an attacker chose, not the one this
+plugin actually created. FileView-by-path has the same problem for the
+files inside it, plus no defense against a pre-existing FIFO (which would
+block a read/write open forever) or a swapped-in oversized file. Opening
+each path component with O_NOFOLLOW (refuse a symlink) and O_DIRECTORY
+(refuse anything that isn't a directory), one component at a time relative
+to the previous component's own held file descriptor, closes all of that
+off: even a symlink planted in the exact instant between two of our own
+syscalls fails the next open rather than being silently followed. See
+HANCORE-linux/omarchy-plugin-marketplace#2459 for the review history that
+produced this shape.
+
+Usage:
+  umami-state ensure-dir     create/verify the state dir, chmod 700; nothing on stdout
+  umami-state read <name>    print the named file's content on stdout
+  umami-state write <name>   write stdin's content (capped) to the named file, chmod 600
+
+<name> is a plain filename, one of the small fixed set this plugin
+actually uses (see VALID_NAMES below) -- validated, never taken as a path.
+
+Exit codes:
+  0  success
+  2  content exceeded the byte cap (existing file on read, stdin on write)
+  3  security violation: a symlink or the wrong file/directory type was
+     found somewhere in the path, or (read/write) the file isn't owned by
+     the current user
+  4  any other failure (OS error, bad argv, missing $HOME)
+  5  (read only) the file does not exist yet -- normal on first run
+"""
+
+import os
+import stat
+import sys
+
+MAX_STATE_FILE_BYTES = int(os.environ.get("UMAMI_STATE_MAX_BYTES", str(64 * 1024)))
+
+# Components created directly under $HOME if missing, in order, ending in
+# this plugin's own dedicated directory. Every component but the last is
+# shared with other plugins/omarchy-shell itself, so a missing one is
+# created at a conventional 0755 -- only the last one is ours to lock down.
+STATE_PATH_COMPONENTS = [".local", "state", "omarchy", "settings", "io.github.rolfkoenders.umarchy"]
+
+VALID_NAMES = ("umarchy.json", "umarchy-token.json")
+
+
+class SecurityViolation(Exception):
+    pass
+
+
+def open_dir_component(name, parent_fd, create_mode):
+    """Open `name` under parent_fd as a real directory, no-follow.
+
+    Creates it (at create_mode) if missing. Raises SecurityViolation if
+    `name` exists but is a symlink or anything other than a directory --
+    including a symlink to a directory, which mkdir -p and a plain
+    os.path.isdir() check would both silently accept.
+    """
+    flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC
+    try:
+        return os.open(name, flags, dir_fd=parent_fd)
+    except FileNotFoundError:
+        pass
+    except OSError as e:
+        raise SecurityViolation(f"{name} exists but is not a plain directory: {e}")
+    try:
+        os.mkdir(name, create_mode, dir_fd=parent_fd)
+    except FileExistsError:
+        pass  # lost a race creating it; the open below is still no-follow
+    try:
+        return os.open(name, flags, dir_fd=parent_fd)
+    except OSError as e:
+        raise SecurityViolation(f"{name} could not be opened as a plain directory after creation: {e}")
+
+
+def open_state_dir():
+    """Walk from $HOME to the plugin's state directory, component by
+    component, never resolving the full path in one call. Returns an open
+    file descriptor for the final (our own, 0700) directory.
+    """
+    home = os.environ.get("HOME")
+    if not home:
+        raise RuntimeError("HOME is not set")
+    fd = os.open(home, os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC)
+    try:
+        for name in STATE_PATH_COMPONENTS:
+            is_last = name == STATE_PATH_COMPONENTS[-1]
+            mode = 0o700 if is_last else 0o755
+            next_fd = open_dir_component(name, fd, mode)
+            os.close(fd)
+            fd = next_fd
+        # Always (re-)assert 0700 on our own directory via the fd itself --
+        # never by path -- whether we just created it or it already existed
+        # from an earlier run, and regardless of who created it.
+        os.chmod(fd, 0o700)
+        st = os.fstat(fd)
+        if st.st_uid != os.getuid():
+            raise SecurityViolation("state directory is not owned by the current user")
+        return fd
+    except Exception:
+        os.close(fd)
+        raise
+
+
+def open_state_file(dir_fd, name, for_write):
+    if name not in VALID_NAMES:
+        raise RuntimeError("unknown state file name")
+    # O_NONBLOCK means an open against a pre-existing FIFO returns
+    # immediately instead of blocking forever waiting for a reader/writer;
+    # it has no effect on a real regular file, which is the only thing
+    # this is ever expected to open.
+    flags = os.O_NOFOLLOW | os.O_CLOEXEC | os.O_NONBLOCK
+    flags |= (os.O_WRONLY | os.O_CREAT) if for_write else os.O_RDONLY
+    try:
+        fd = os.open(name, flags, 0o600, dir_fd=dir_fd)
+    except FileNotFoundError:
+        raise
+    except OSError as e:
+        raise SecurityViolation(f"{name} could not be opened safely: {e}")
+    try:
+        st = os.fstat(fd)
+        if not stat.S_ISREG(st.st_mode):
+            raise SecurityViolation(f"{name} exists but is not a plain file")
+        if st.st_uid != os.getuid():
+            raise SecurityViolation(f"{name} is not owned by the current user")
+        return fd, st
+    except Exception:
+        os.close(fd)
+        raise
+
+
+def cmd_ensure_dir():
+    os.close(open_state_dir())
+
+
+def cmd_read(name):
+    dir_fd = open_state_dir()
+    try:
+        try:
+            fd, st = open_state_file(dir_fd, name, for_write=False)
+        except FileNotFoundError:
+            sys.exit(5)
+        try:
+            if st.st_size > MAX_STATE_FILE_BYTES:
+                print(f"{name} exceeds the {MAX_STATE_FILE_BYTES} byte limit", file=sys.stderr)
+                sys.exit(2)
+            data = os.read(fd, MAX_STATE_FILE_BYTES + 1)
+            if len(data) > MAX_STATE_FILE_BYTES:
+                print(f"{name} exceeds the {MAX_STATE_FILE_BYTES} byte limit", file=sys.stderr)
+                sys.exit(2)
+            sys.stdout.buffer.write(data)
+        finally:
+            os.close(fd)
+    finally:
+        os.close(dir_fd)
+
+
+def cmd_write(name):
+    data = sys.stdin.buffer.read(MAX_STATE_FILE_BYTES + 1)
+    if len(data) > MAX_STATE_FILE_BYTES:
+        print(f"input exceeds the {MAX_STATE_FILE_BYTES} byte limit", file=sys.stderr)
+        sys.exit(2)
+    dir_fd = open_state_dir()
+    try:
+        fd, _st = open_state_file(dir_fd, name, for_write=True)
+        try:
+            os.ftruncate(fd, 0)
+            os.write(fd, data)
+            os.fsync(fd)
+            os.fchmod(fd, 0o600)
+        finally:
+            os.close(fd)
+    finally:
+        os.close(dir_fd)
+
+
+def main():
+    if len(sys.argv) < 2:
+        print("usage: umami-state <ensure-dir|read|write> [name]", file=sys.stderr)
+        sys.exit(4)
+    op = sys.argv[1]
+    try:
+        if op == "ensure-dir":
+            cmd_ensure_dir()
+        elif op == "read":
+            cmd_read(sys.argv[2])
+        elif op == "write":
+            cmd_write(sys.argv[2])
+        else:
+            raise RuntimeError("unknown operation")
+    except SystemExit:
+        raise
+    except SecurityViolation as e:
+        print(str(e), file=sys.stderr)
+        sys.exit(3)
+    except Exception as e:
+        print(str(e), file=sys.stderr)
+        sys.exit(4)
+    sys.exit(0)
+
+
+if __name__ == "__main__":
+    main()
