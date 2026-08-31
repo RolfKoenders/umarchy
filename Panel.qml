@@ -34,6 +34,10 @@ Panel {
     stats.refresh()
   }
 
+  function rescanSites() {
+    stats.rescanSites()
+  }
+
   function saveSetup() {
     stats.saveConnection(hostField.text, usernameField.text, passwordField.text)
   }
@@ -178,7 +182,7 @@ Panel {
   }
 
   function handleBarPress(b) {
-    if (b === Qt.MiddleButton) root.refresh()
+    if (b === Qt.MiddleButton) root.rescanSites()
     else if (b === Qt.RightButton && stats.config.host) omarchyOpen.openHost(stats.config.host)
     else root.toggle()
   }
@@ -260,7 +264,7 @@ Panel {
       onCloseRequested: root.close()
       onTabRequested: function(direction) { root.switchPanel(direction) }
       onTextKey: function(t) {
-        if (t === "r" || t === "R") root.refresh()
+        if (t === "r" || t === "R") root.rescanSites()
         else if (t === "1") stats.setPeriod("today")
         else if (t === "2") stats.setPeriod("7d")
         else if (t === "3") stats.setPeriod("30d")
@@ -422,7 +426,7 @@ Panel {
                     foreground: root.contentForeground
                     fontFamily: root.contentFontFamily
                     enabled: !stats.loading
-                    onClicked: root.refresh()
+                    onClicked: root.rescanSites()
                   }
 
                   PanelActionButton {
