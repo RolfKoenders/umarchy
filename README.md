@@ -53,8 +53,10 @@ these settings.
   period.
 - A pageviews-over-time chart (hourly for Today, daily for 7d/30d).
 - Top pages, top referrers, and top countries for the selected period.
-- Switch between every site the account can see — no aggregation across
-  sites, since unrelated websites' traffic isn't meaningfully summable.
+- Switch between every site the account can see — including sites owned by
+  a team the account belongs to, at any role, not only sites it directly
+  owns — no aggregation across sites, since unrelated websites' traffic
+  isn't meaningfully summable.
 - Middle-click the bar icon to refresh; right-click to open the instance in
   your browser.
 - Automatic re-login, once, if the session token is rejected — you're only
