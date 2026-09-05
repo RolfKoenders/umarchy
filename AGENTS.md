@@ -135,6 +135,15 @@ time.
   `tests/test_umami_state.py`, which plants each of these attacks for real
   in a scratch `$HOME` (symlinked directory, symlinked file, FIFO,
   oversized file) and confirms every one is refused.
+- **`GET /api/websites?includeTeams=true` does not fix "team sites don't
+  show up" for a View Only member.** (Issue #1.) That route's team-inclusion
+  path is gated to `role in [teamOwner, teamManager]` server-side
+  (`getAllUserWebsitesIncludingTeamAccess` in Umami's own source) — View
+  Only is neither, so it still comes back empty for exactly the
+  README-recommended setup. The only path that covers every team role is
+  `GET /api/me/teams` (no role filter at all) followed by
+  `GET /api/teams/{id}/websites` (readable by any team member, any role) —
+  see `Service.qml`'s `fetchSites`.
 - **A `Process` with `stdinEnabled: true` doesn't send EOF just because
   you're done calling `write()`.** `bin/umami-state`'s write command reads
   a fixed-size-capped chunk of stdin (it can't use `readline()` — the JSON

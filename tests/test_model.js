@@ -167,6 +167,67 @@ function run_parse_sites_caps_row_count() {
   check("site list is capped, not unbounded", sites.length < 500);
 }
 
+function run_parse_team_ids_unwraps_paginated_envelope() {
+  const Model = loadModel();
+  const raw = { data: [{ id: "team-1" }, { id: "team-2" }], count: 2, page: 1, pageSize: 100 };
+  const ids = Model.parseTeamIds(raw);
+  check("paginated envelope is unwrapped", ids.length === 2 && ids[0] === "team-1" && ids[1] === "team-2");
+}
+
+function run_parse_team_ids_skips_rows_with_no_id() {
+  const Model = loadModel();
+  const raw = [{ id: "team-1" }, { name: "no id, skipped" }];
+  const ids = Model.parseTeamIds(raw);
+  check("rows with no id are skipped", ids.length === 1 && ids[0] === "team-1");
+}
+
+function run_parse_team_ids_caps_at_max_teams() {
+  const Model = loadModel();
+  const raw = [];
+  for (let i = 0; i < 50; i++) raw.push({ id: "team-" + i });
+  const ids = Model.parseTeamIds(raw);
+  check("team id list is capped at MAX_TEAMS (20)", ids.length === 20);
+}
+
+function run_parse_team_ids_handles_garbage() {
+  const Model = loadModel();
+  check("null input yields empty list", Model.parseTeamIds(null).length === 0);
+  check("object with no data field yields empty list", Model.parseTeamIds({}).length === 0);
+  check("bare non-array yields empty list", Model.parseTeamIds("nope").length === 0);
+}
+
+function run_merge_sites_concatenates_owned_and_team_sites() {
+  const Model = loadModel();
+  const owned = [{ id: "1", name: "Owned" }];
+  const team = [{ id: "2", name: "Team" }];
+  const merged = Model.mergeSites(owned, team);
+  check("both inputs present in output", merged.length === 2);
+}
+
+function run_merge_sites_dedups_by_id() {
+  const Model = loadModel();
+  const owned = [{ id: "1", name: "Owned" }];
+  const team = [{ id: "1", name: "Owned again" }];
+  const merged = Model.mergeSites(owned, team);
+  check("duplicate id appears once", merged.length === 1);
+}
+
+function run_merge_sites_handles_missing_inputs() {
+  const Model = loadModel();
+  check("both missing yields empty list", Model.mergeSites(undefined, null).length === 0);
+  check("one missing treated as empty", Model.mergeSites([{ id: "1" }], null).length === 1);
+}
+
+function run_merge_sites_caps_combined_output() {
+  const Model = loadModel();
+  const owned = [];
+  for (let i = 0; i < 60; i++) owned.push({ id: "o" + i });
+  const team = [];
+  for (let i = 0; i < 60; i++) team.push({ id: "t" + i });
+  const merged = Model.mergeSites(owned, team);
+  check("merged site list is capped, not unbounded", merged.length === 100);
+}
+
 function run_active_site_finds_by_id_or_falls_back() {
   const Model = loadModel();
   const sites = [{ id: "1", name: "One" }, { id: "2", name: "Two" }];
@@ -341,6 +402,14 @@ const runners = [
   run_parse_sites_unwraps_paginated_envelope,
   run_parse_sites_handles_garbage,
   run_parse_sites_caps_row_count,
+  run_parse_team_ids_unwraps_paginated_envelope,
+  run_parse_team_ids_skips_rows_with_no_id,
+  run_parse_team_ids_caps_at_max_teams,
+  run_parse_team_ids_handles_garbage,
+  run_merge_sites_concatenates_owned_and_team_sites,
+  run_merge_sites_dedups_by_id,
+  run_merge_sites_handles_missing_inputs,
+  run_merge_sites_caps_combined_output,
   run_active_site_finds_by_id_or_falls_back,
   run_parse_stats_extracts_value_fields,
   run_parse_stats_handles_missing_data,

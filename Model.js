@@ -18,6 +18,12 @@ var MAX_LIST_ROWS = 20
 var MAX_SERIES_POINTS = 400
 var MAX_FIELD_LENGTH = 200
 
+// Caps the per-team fan-out in fetchSites (Service.qml) — enforced
+// client-side regardless of what the server reports, so a malicious or
+// compromised Umami instance can't force an amplified subprocess fan-out
+// by claiming an enormous number of teams.
+var MAX_TEAMS = 20
+
 function trim(value) {
   return String(value === undefined || value === null ? "" : value).replace(/^\s+|\s+$/g, "")
 }
@@ -145,6 +151,43 @@ function parseSites(raw) {
       name: truncateField(row.name || row.domain || row.id),
       domain: truncateField(row.domain || "")
     })
+  }
+  return out
+}
+
+// GET /api/me/teams's shape mirrors /api/websites: {data: [...], count,
+// page, pageSize}, not a bare array (same envelope). Returns a capped list
+// of team id strings, in whatever order the API returns (no explicit sort
+// — see the plan's decision #5).
+function parseTeamIds(raw) {
+  var parsed = asJson(raw)
+  var data = Array.isArray(parsed) ? parsed
+    : (parsed && Array.isArray(parsed.data)) ? parsed.data : []
+  var out = []
+  for (var i = 0; i < data.length && out.length < MAX_TEAMS; i++) {
+    var row = data[i]
+    if (!row || row.id === undefined || row.id === null) continue
+    out.push(truncateField(row.id))
+  }
+  return out
+}
+
+// Owned sites and team sites can never collide by id (a website's userId
+// and teamId are mutually exclusive server-side), so dedup here is
+// defense-in-depth, not a case this is actually expected to hit.
+// Object.create(null) sidesteps any "id happens to be a prototype property
+// name" edge case in the dedup map. Caps the merged output at the same
+// MAX_LIST_ROWS * 5 (100) row limit a single /api/websites response already
+// gets, since results here can come from up to 1 + MAX_TEAMS responses.
+function mergeSites(ownedSites, teamSites) {
+  var seen = Object.create(null)
+  var out = []
+  var all = (Array.isArray(ownedSites) ? ownedSites : []).concat(Array.isArray(teamSites) ? teamSites : [])
+  for (var i = 0; i < all.length && out.length < MAX_LIST_ROWS * 5; i++) {
+    var site = all[i]
+    if (!site || seen[site.id]) continue
+    seen[site.id] = true
+    out.push(site)
   }
   return out
 }

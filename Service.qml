@@ -83,22 +83,88 @@ Item {
     }
   }
 
+  // Two phases: phase 1 fetches owned sites and the member's team ids in
+  // parallel; phase 2 (only if any teams were found) fans out one call per
+  // team, since it depends on phase 1's team-id list. Owned sites are the
+  // one thing that must succeed — losing that would be a regression, not a
+  // degradation. Team discovery is best-effort throughout (an old
+  // self-hosted Umami with no Teams API, or any single team's fetch
+  // failing, just means that part of the result stays empty) — same
+  // "silently degrade, don't fail the whole thing" precedent as
+  // timezoneProc below.
   function fetchSites(then) {
     root.loadingSites = true
+
+    var ownedSites = []
+    var teamIds = []
+    var hardError = ""
+    var phaseOnePending = 2
+
+    function phaseOneDone() {
+      phaseOnePending -= 1
+      if (phaseOnePending > 0) return
+      if (hardError) { finish([]); return }
+      startPhaseTwo()
+    }
+
     // /api/websites paginates (default pageSize 10); 100 comfortably covers
     // a personal/self-hosted account without needing real pagination.
     root.authorizedRequest("GET", "/api/websites?pageSize=100", null, function(result, errorMessage) {
+      if (errorMessage) { hardError = errorMessage } else { ownedSites = Model.parseSites(result) }
+      phaseOneDone()
+    })
+
+    root.authorizedRequest("GET", "/api/me/teams?pageSize=100", null, function(result, errorMessage) {
+      if (!errorMessage) teamIds = Model.parseTeamIds(result)
+      phaseOneDone()
+    })
+
+    function startPhaseTwo() {
+      if (teamIds.length === 0) { finish([]); return }
+      var teamSites = []
+      var phaseTwoPending = teamIds.length
+      for (var i = 0; i < teamIds.length; i++) {
+        var path = "/api/teams/" + encodeURIComponent(teamIds[i]) + "/websites?pageSize=100"
+        root.authorizedRequest("GET", path, null, function(result, errorMessage) {
+          if (!errorMessage) teamSites = teamSites.concat(Model.parseSites(result))
+          phaseTwoPending -= 1
+          if (phaseTwoPending <= 0) finish(teamSites)
+        })
+      }
+    }
+
+    function finish(teamSites) {
       root.loadingSites = false
-      if (errorMessage) {
-        root.failLoad(errorMessage)
+      if (hardError) {
+        root.failLoad(hardError)
         return
       }
-      root.sites = Model.parseSites(result)
+      // root.sites is never cleared before this point — whatever was there
+      // from a prior successful fetch stays on screen until this
+      // assignment, which is what makes rescanSites() below flicker-free.
+      root.sites = Model.mergeSites(ownedSites, teamSites)
       if (!root.config.siteId && root.sites.length) {
         root.setSiteId(root.sites[0].id, false)
       }
       then()
-    })
+    }
+  }
+
+  // The explicit-refresh path: unlike refresh() (used by the passive timer,
+  // panel-open, and the external IPC command — see Panel.qml), this always
+  // re-runs full site/team discovery, not just the stats bundle for
+  // whatever sites are already known — otherwise joining a new team, or
+  // gaining a new owned site, while the widget is already running would
+  // require a restart to show up. Guarded once, here, rather than at each
+  // Panel.qml call site: a stray double-trigger from middle-click or the r
+  // key (neither of which checks stats.loading the way the Refresh
+  // button's `enabled` binding does) becomes a no-op instead of two
+  // overlapping ~22-subprocess fetches.
+  function rescanSites() {
+    if (!root.ready || root.loading) return
+    root.loading = true
+    root.lastError = ""
+    root.fetchSites(function() { root.fetchStatsBundle() })
   }
 
   function fetchStatsBundle() {
